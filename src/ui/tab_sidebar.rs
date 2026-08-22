@@ -280,10 +280,10 @@ impl Tty7App {
                 let tab = &self.tabs[i];
                 let is_active = i == active;
                 let ssh_dot = self.tab_ssh_dot(tab, cx);
-                let agent_row = tab.agent_row(cx);
-                let agent = agent_row.map(|(agent, _)| agent);
-                let agent_status = agent_row.map(|(_, status)| status);
-                let agent_unread = tab.agent_unread_count(cx);
+                let agent_badge = tab.focused_agent_badge(window, cx);
+                let agent = agent_badge.agent;
+                let agent_status = agent_badge.status;
+                let agent_unread = agent_badge.unread;
                 let git_cwd = diff_click_cwd(
                     cx.global::<Config>(),
                     tab.pane.focused_or_first(window, cx).and_then(|leaf| {

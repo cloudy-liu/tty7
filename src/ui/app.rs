@@ -470,6 +470,25 @@ fn most_urgent_agent_row(
     rows.into_iter().max_by_key(|(_, status)| urgency(*status))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TabAgentBadge {
+    pub(crate) agent: Option<crate::core::cli_agent::CLIAgent>,
+    pub(crate) status: Option<crate::core::cli_agent::AgentStatus>,
+    pub(crate) unread: usize,
+}
+
+fn badge_for_focused_pane(
+    focused: Option<gpui::EntityId>,
+    rows: impl IntoIterator<Item = (gpui::EntityId, TabAgentBadge)>,
+) -> TabAgentBadge {
+    let Some(focused) = focused else {
+        return TabAgentBadge::default();
+    };
+    rows.into_iter()
+        .find_map(|(pane, badge)| (pane == focused).then_some(badge))
+        .unwrap_or_default()
+}
+
 impl Tab {
     pub(crate) fn new(pane: Pane) -> Self {
         Self {
@@ -571,6 +590,36 @@ impl Tab {
 
     pub(crate) fn agent(&self, cx: &App) -> Option<crate::core::cli_agent::CLIAgent> {
         self.agent_row(cx).map(|(agent, _)| agent)
+    }
+
+    pub(crate) fn focused_agent_badge(&self, window: &Window, cx: &App) -> TabAgentBadge {
+        use crate::core::cli_agent::AgentStatus;
+
+        let focused = self
+            .pane
+            .focused_leaf(window, cx)
+            .or_else(|| self.focus_target())
+            .map(|leaf| leaf.entity_id());
+        badge_for_focused_pane(
+            focused,
+            self.pane.terminals().into_iter().map(|leaf| {
+                let view = leaf.read(cx);
+                let agent = view.agent();
+                let session_status = view.agent_session().map(|session| session.status);
+                let status = agent.map(|_| session_status.unwrap_or(AgentStatus::Idle));
+                let unread = usize::from(
+                    session_status == Some(AgentStatus::Done) && view.agent_result_unread(),
+                );
+                (
+                    leaf.entity_id(),
+                    TabAgentBadge {
+                        agent,
+                        status,
+                        unread,
+                    },
+                )
+            }),
+        )
     }
 
     /// The tab's most urgent agent leaf, named and reported by that one leaf.
@@ -8721,11 +8770,11 @@ mod window_drag_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CloseReason, DOCUMENT_MIN_W, TERMINAL_MIN_W, TITLE_BAR_HEIGHT, TabAgentSession,
-        clear_window_override_values, close_prompt, document_column_px, join_shell_args,
-        leaf_shares_the_window_daemon, most_urgent_agent_row, mru_order, pane_free_for,
-        parse_ssh_connect_input, parse_ssh_option_words, side_panel_max, split_shell_args,
-        strip_band, wd_path_saveable,
+        CloseReason, DOCUMENT_MIN_W, TERMINAL_MIN_W, TITLE_BAR_HEIGHT, TabAgentBadge,
+        TabAgentSession, badge_for_focused_pane, clear_window_override_values, close_prompt,
+        document_column_px, join_shell_args, leaf_shares_the_window_daemon, most_urgent_agent_row,
+        mru_order, pane_free_for, parse_ssh_connect_input, parse_ssh_option_words, side_panel_max,
+        split_shell_args, strip_band, wd_path_saveable,
     };
     use gpui::{Edges, point, px, size};
 
@@ -8740,6 +8789,41 @@ mod tests {
                 (CLIAgent::Cursor, AgentStatus::Waiting),
             ]),
             Some((CLIAgent::Cursor, AgentStatus::Waiting))
+        );
+    }
+
+    #[test]
+    fn tab_chrome_agent_badges_follow_the_focused_split() {
+        use crate::core::cli_agent::{AgentStatus, CLIAgent};
+
+        let kestrel_pane = gpui::EntityId::from(1);
+        let codex_pane = gpui::EntityId::from(2);
+        let kestrel_badge = TabAgentBadge {
+            agent: Some(CLIAgent::Cursor),
+            status: Some(AgentStatus::Idle),
+            unread: 0,
+        };
+        let codex_badge = TabAgentBadge {
+            agent: Some(CLIAgent::Codex),
+            status: Some(AgentStatus::Done),
+            unread: 1,
+        };
+        let rows = [(kestrel_pane, kestrel_badge), (codex_pane, codex_badge)];
+
+        assert_eq!(
+            badge_for_focused_pane(Some(kestrel_pane), rows),
+            kestrel_badge,
+            "the Kestrel pane owns the badge while it is focused"
+        );
+        assert_eq!(
+            badge_for_focused_pane(Some(codex_pane), rows),
+            codex_badge,
+            "the Codex pane owns the badge after focus moves to it"
+        );
+        assert_eq!(
+            badge_for_focused_pane(Some(kestrel_pane), rows),
+            kestrel_badge,
+            "returning focus to the Kestrel pane must restore its badge even when Codex is more urgent"
         );
     }
 
