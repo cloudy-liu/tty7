@@ -449,6 +449,27 @@ pub(crate) enum OverlayTop {
     Diff,
 }
 
+fn most_urgent_agent_row(
+    rows: impl IntoIterator<
+        Item = (
+            crate::core::cli_agent::CLIAgent,
+            crate::core::cli_agent::AgentStatus,
+        ),
+    >,
+) -> Option<(
+    crate::core::cli_agent::CLIAgent,
+    crate::core::cli_agent::AgentStatus,
+)> {
+    use crate::core::cli_agent::AgentStatus;
+    let urgency = |status: AgentStatus| match status {
+        AgentStatus::Waiting => 3,
+        AgentStatus::Working => 2,
+        AgentStatus::Done => 1,
+        AgentStatus::Idle => 0,
+    };
+    rows.into_iter().max_by_key(|(_, status)| urgency(*status))
+}
+
 impl Tab {
     pub(crate) fn new(pane: Pane) -> Self {
         Self {
@@ -549,19 +570,13 @@ impl Tab {
     }
 
     pub(crate) fn agent(&self, cx: &App) -> Option<crate::core::cli_agent::CLIAgent> {
-        self.pane
-            .terminals()
-            .into_iter()
-            .find_map(|l| l.read(cx).agent())
+        self.agent_row(cx).map(|(agent, _)| agent)
     }
 
     /// The tab's most urgent agent leaf, named and reported by that one leaf.
     ///
-    /// `agent` and `agent_status` answer independently — the *first* leaf
-    /// carrying an agent, and the highest urgency found *anywhere* in the tab
-    /// — so reading them as a pair can put one pane's name beside another
-    /// pane's state, a row no leaf ever had. Anywhere both halves are shown
-    /// at once reads them from here instead (#543).
+    /// Both `agent` and `agent_status` project this same selection, so callers
+    /// cannot put one pane's icon beside another pane's status (#543).
     pub(crate) fn agent_row(
         &self,
         cx: &App,
@@ -570,28 +585,19 @@ impl Tab {
         crate::core::cli_agent::AgentStatus,
     )> {
         use crate::core::cli_agent::AgentStatus;
-        let urgency = |s: AgentStatus| match s {
-            AgentStatus::Waiting => 3,
-            AgentStatus::Working => 2,
-            AgentStatus::Done => 1,
-            AgentStatus::Idle => 0,
-        };
-        self.pane
-            .terminals()
-            .into_iter()
-            .filter_map(|l| {
-                let view = l.read(cx);
-                let agent = view.agent()?;
-                // A pane whose agent is running but has never reported a
-                // session reads as idle, the same reading the badge has always
-                // given it.
-                let status = view
-                    .agent_session()
-                    .map(|s| s.status)
-                    .unwrap_or(AgentStatus::Idle);
-                Some((agent, status))
-            })
-            .max_by_key(|(_, status)| urgency(*status))
+
+        most_urgent_agent_row(self.pane.terminals().into_iter().filter_map(|l| {
+            let view = l.read(cx);
+            let agent = view.agent()?;
+            // A pane whose agent is running but has never reported a
+            // session reads as idle, the same reading the badge has always
+            // given it.
+            let status = view
+                .agent_session()
+                .map(|s| s.status)
+                .unwrap_or(AgentStatus::Idle);
+            Some((agent, status))
+        }))
     }
 
     pub(crate) fn agent_status(&self, cx: &App) -> Option<crate::core::cli_agent::AgentStatus> {
@@ -8717,10 +8723,25 @@ mod tests {
     use super::{
         CloseReason, DOCUMENT_MIN_W, TERMINAL_MIN_W, TITLE_BAR_HEIGHT, TabAgentSession,
         clear_window_override_values, close_prompt, document_column_px, join_shell_args,
-        leaf_shares_the_window_daemon, mru_order, pane_free_for, parse_ssh_connect_input,
-        parse_ssh_option_words, side_panel_max, split_shell_args, strip_band, wd_path_saveable,
+        leaf_shares_the_window_daemon, most_urgent_agent_row, mru_order, pane_free_for,
+        parse_ssh_connect_input, parse_ssh_option_words, side_panel_max, split_shell_args,
+        strip_band, wd_path_saveable,
     };
     use gpui::{Edges, point, px, size};
+
+    #[test]
+    fn the_agent_icon_and_status_come_from_the_same_most_urgent_pane() {
+        use crate::core::cli_agent::{AgentStatus, CLIAgent};
+
+        assert_eq!(
+            most_urgent_agent_row([
+                (CLIAgent::Claude, AgentStatus::Idle),
+                (CLIAgent::Codex, AgentStatus::Working),
+                (CLIAgent::Cursor, AgentStatus::Waiting),
+            ]),
+            Some((CLIAgent::Cursor, AgentStatus::Waiting))
+        );
+    }
 
     const SIDEBAR_MIN: f32 = crate::ui::tab_sidebar::MIN_SIDEBAR_WIDTH;
     const PANEL_MIN: f32 = crate::ui::right_panel::MIN_WIDTH;
