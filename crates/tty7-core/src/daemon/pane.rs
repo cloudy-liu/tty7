@@ -1460,6 +1460,8 @@ impl DaemonPane {
         let fg_master = master.clone();
         let remote_master = master.clone();
         let agent_master = master.clone();
+        let process_agent_seen = Mutex::new(None);
+        let agent_state = state.clone();
         let cwd_master = master.clone();
         let reader = Self::spawn_reader(
             state,
@@ -1470,7 +1472,9 @@ impl DaemonPane {
             move || foreground_command_running(&fg_master, shell_pid),
             ForegroundProbes {
                 remote: Box::new(move || foreground_remote_context(&remote_master)),
-                agent: Box::new(move || foreground_agent(&agent_master)),
+                agent: Box::new(move || {
+                    foreground_agent(&agent_master, shell_pid, &process_agent_seen, &agent_state)
+                }),
                 cwd: Box::new(move || foreground_cwd(&cwd_master, shell_pid)),
             },
             death,
@@ -2591,7 +2595,7 @@ fn apply_agent_signals(
     events: Vec<crate::core::cli_agent::AgentEvent>,
     notification: Option<String>,
 ) {
-    use crate::core::cli_agent::{AgentSessionState, AgentStatus};
+    use crate::core::cli_agent::{AgentEventKind, AgentSessionState, AgentStatus};
 
     if events.is_empty() && notification.is_none() {
         return;
@@ -2599,9 +2603,40 @@ fn apply_agent_signals(
     let before = st.agent_session.clone();
 
     for event in &events {
-        if st.agent.is_none() && event.agent.is_some() {
-            st.agent = event.agent;
-            notify(st, DaemonMsg::Agent(st.agent));
+        let same_session = match (
+            event.session_id.as_deref(),
+            st.agent_session
+                .as_ref()
+                .and_then(|session| session.session_id.as_deref()),
+        ) {
+            (Some(event), Some(active)) => event == active,
+            _ => true,
+        };
+        let same_agent = event.agent.is_none() || event.agent == st.agent;
+
+        if event.kind == AgentEventKind::SessionEnd {
+            // A hook can arrive after another agent has already replaced the
+            // process in this pane. Only the session that still owns the row
+            // may remove it; a late Claude shutdown must not erase Cursor.
+            if st.agent.is_some() && same_agent && same_session {
+                st.agent_session = None;
+                st.agent_argv = None;
+                st.agent = None;
+                notify(st, DaemonMsg::Agent(None));
+            }
+            continue;
+        }
+
+        if let Some(agent) = event.agent
+            && st.agent != Some(agent)
+        {
+            // Hook identity is stronger than a stale pane value. Reset the
+            // old session before applying this event so the two agents cannot
+            // share an id/status/launch argv.
+            st.agent_session = None;
+            st.agent_argv = None;
+            st.agent = Some(agent);
+            notify(st, DaemonMsg::Agent(Some(agent)));
         }
         st.agent_session
             .get_or_insert_with(AgentSessionState::default)
@@ -2673,13 +2708,13 @@ fn apply_agent(
         stamp_launch_argv(st, argv);
         return;
     }
-    if agent.is_none() && st.agent_session.is_some() {
+    // Identity changed — including A → B, not just A → none. A leftover
+    // Claude session must not sit under a process-detected Cursor icon.
+    if st.agent_session.is_some() {
         st.agent_session = None;
         notify(st, DaemonMsg::AgentStatus(None));
     }
-    if agent.is_none() {
-        st.agent_argv = None;
-    }
+    st.agent_argv = None;
     notify(st, DaemonMsg::Agent(agent));
     st.agent = agent;
     stamp_launch_argv(st, argv);
@@ -2816,6 +2851,9 @@ fn foreground_remote_context(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn foreground_agent(
     master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    _shell_pid: Option<u32>,
+    _process_agent_seen: &Mutex<Option<crate::core::cli_agent::CLIAgent>>,
+    _state: &Mutex<PaneState>,
 ) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
     let detect = || {
         let pid = master
@@ -2832,11 +2870,47 @@ fn foreground_agent(
     Some(detect())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
 fn foreground_agent(
     _master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    shell_pid: Option<u32>,
+    process_agent_seen: &Mutex<Option<crate::core::cli_agent::CLIAgent>>,
+    state: &Mutex<PaneState>,
+) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
+    let detected = shell_pid.and_then(|pid| {
+        crate::daemon::winproc::foreground_agent(pid, crate::core::config::agent_commands_cached())
+    });
+    let active_agent = state.lock().ok()?.agent;
+    let mut seen = process_agent_seen.lock().ok()?;
+    windows_agent_probe_signal(&mut seen, detected, active_agent)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn foreground_agent(
+    _master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    _shell_pid: Option<u32>,
+    _process_agent_seen: &Mutex<Option<crate::core::cli_agent::CLIAgent>>,
+    _state: &Mutex<PaneState>,
 ) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
     None
+}
+
+#[cfg(windows)]
+fn windows_agent_probe_signal(
+    process_agent: &mut Option<crate::core::cli_agent::CLIAgent>,
+    detected: Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>,
+    active_agent: Option<crate::core::cli_agent::CLIAgent>,
+) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
+    match detected {
+        Some(found) => {
+            *process_agent = Some(found.0);
+            Some(Some(found))
+        }
+        None => {
+            let departed = process_agent.take()?;
+            (active_agent == Some(departed)).then_some(None)
+        }
+    }
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -3184,10 +3258,12 @@ mod tests {
         cmd.args(["-c", "exec -a codex cat"]);
         let mut child = pty.slave.spawn_command(cmd).expect("spawn child");
         let master = Mutex::new(Some(pty.master));
+        let seen = Mutex::new(None);
+        let state = Mutex::new(test_state(true));
 
         let mut detected = None;
         for _ in 0..200 {
-            if let Some(agent) = foreground_agent(&master).flatten() {
+            if let Some(agent) = foreground_agent(&master, None, &seen, &state).flatten() {
                 detected = Some(agent);
                 break;
             }
@@ -4425,6 +4501,149 @@ mod tests {
         assert!(st.agent_session.is_none());
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::AgentStatus(None))));
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Agent(None))));
+    }
+
+    #[test]
+    fn session_end_removes_the_agent_identity_from_the_pane() {
+        use crate::core::cli_agent::CLIAgent;
+
+        let mut st = test_state(true);
+        st.agent_argv = Some(vec!["claude".into()]);
+        let mut sniffer = OscSniffer::new();
+        let start = concat!(
+            "\x1b]777;notify;tty7://cli-agent;",
+            r#"{"agent":"claude","event":"session-start","session_id":"old"}"#,
+            "\x07",
+        );
+        apply_signals(&mut st, sniffer.feed(start.as_bytes()));
+        assert_eq!(st.agent, Some(CLIAgent::Claude));
+
+        let end = concat!(
+            "\x1b]777;notify;tty7://cli-agent;",
+            r#"{"agent":"claude","event":"session-end","session_id":"old"}"#,
+            "\x07",
+        );
+        apply_signals(&mut st, sniffer.feed(end.as_bytes()));
+
+        assert_eq!(st.agent, None);
+        assert!(st.agent_session.is_none());
+        assert!(st.agent_argv.is_none());
+    }
+
+    #[test]
+    fn a_new_agent_event_replaces_stale_identity_and_ignores_the_old_session_end() {
+        use crate::core::cli_agent::CLIAgent;
+
+        let mut st = test_state(true);
+        let mut sniffer = OscSniffer::new();
+        let old = concat!(
+            "\x1b]777;notify;tty7://cli-agent;",
+            r#"{"agent":"claude","event":"session-start","session_id":"old"}"#,
+            "\x07",
+        );
+        apply_signals(&mut st, sniffer.feed(old.as_bytes()));
+
+        let replacement = concat!(
+            "\x1b]777;notify;tty7://cli-agent;",
+            r#"{"agent":"cursor","event":"session-start","session_id":"new"}"#,
+            "\x07",
+        );
+        apply_signals(&mut st, sniffer.feed(replacement.as_bytes()));
+        assert_eq!(st.agent, Some(CLIAgent::Cursor));
+        assert_eq!(
+            st.agent_session
+                .as_ref()
+                .and_then(|s| s.session_id.as_deref()),
+            Some("new")
+        );
+
+        let late_end = concat!(
+            "\x1b]777;notify;tty7://cli-agent;",
+            r#"{"agent":"claude","event":"session-end","session_id":"old"}"#,
+            "\x07",
+        );
+        apply_signals(&mut st, sniffer.feed(late_end.as_bytes()));
+        assert_eq!(st.agent, Some(CLIAgent::Cursor));
+        assert_eq!(
+            st.agent_session
+                .as_ref()
+                .and_then(|s| s.session_id.as_deref()),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn a_process_detected_replacement_drops_the_previous_session() {
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+
+        let mut st = test_state(true);
+        st.agent = Some(CLIAgent::Claude);
+        st.agent_argv = Some(vec!["claude".into()]);
+        st.agent_session = Some(AgentSessionState {
+            status: AgentStatus::Working,
+            session_id: Some("old".into()),
+            launch_argv: Some(vec!["claude".into()]),
+            ..Default::default()
+        });
+        let (tx, rx) = mpsc::channel();
+        st.subscriber = Some(tx);
+
+        apply_agent(&mut st, Some((CLIAgent::Cursor, Vec::new())));
+
+        assert_eq!(st.agent, Some(CLIAgent::Cursor));
+        assert!(
+            st.agent_session.is_none(),
+            "Claude's Working must not ride along"
+        );
+        assert!(st.agent_argv.is_none(), "the probe reports identity only");
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::AgentStatus(None))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonMsg::Agent(Some(CLIAgent::Cursor)))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_empty_windows_process_probe_only_clears_an_agent_it_previously_found() {
+        use crate::core::cli_agent::CLIAgent;
+
+        let mut process_agent = None;
+        assert_eq!(
+            windows_agent_probe_signal(&mut process_agent, None, Some(CLIAgent::Claude)),
+            None,
+            "an inconclusive process scan must not erase hook-owned state"
+        );
+
+        let codex = Some((CLIAgent::Codex, vec!["codex.exe".into()]));
+        assert_eq!(
+            windows_agent_probe_signal(&mut process_agent, codex.clone(), None),
+            Some(codex)
+        );
+        assert_eq!(process_agent, Some(CLIAgent::Codex));
+        assert_eq!(
+            windows_agent_probe_signal(&mut process_agent, None, Some(CLIAgent::Cursor)),
+            None,
+            "a replacement hook owner must survive the old process exiting"
+        );
+        assert_eq!(process_agent, None);
+
+        let codex = Some((CLIAgent::Codex, vec!["codex.exe".into()]));
+        assert_eq!(
+            windows_agent_probe_signal(&mut process_agent, codex.clone(), None),
+            Some(codex)
+        );
+        assert_eq!(
+            windows_agent_probe_signal(&mut process_agent, None, Some(CLIAgent::Codex)),
+            Some(None),
+            "the first empty scan after a process-owned agent exits clears it"
+        );
+        assert_eq!(process_agent, None);
+        assert_eq!(
+            windows_agent_probe_signal(&mut process_agent, None, Some(CLIAgent::Codex)),
+            None,
+            "later empty scans are inconclusive again"
+        );
     }
 
     #[test]

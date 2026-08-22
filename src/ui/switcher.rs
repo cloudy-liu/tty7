@@ -885,12 +885,13 @@ impl Tty7App {
                 .into_iter()
                 .map(|i| {
                     let tab = &self.tabs[i];
+                    let agent_row = tab.agent_row(cx);
                     TabRow {
                         id: tab.tree_id.get(),
                         index: i,
                         label: self.tab_label(tab, i, None, cx),
                         named: tab.name.as_deref().is_some_and(|n| !n.trim().is_empty())
-                            || tab.agent(cx).is_some(),
+                            || agent_row.is_some(),
                         path: tab
                             .pane
                             .terminals()
@@ -901,8 +902,8 @@ impl Tty7App {
                             })
                             .map(|(p, home)| crate::ui::home::display_path(&p, home.as_deref()))
                             .unwrap_or_default(),
-                        agent: tab.agent(cx),
-                        status: tab.agent_status(cx),
+                        agent: agent_row.map(|(agent, _)| agent),
+                        status: agent_row.map(|(_, status)| status),
                         unread: tab.agent_unread_count(cx),
                         ssh: self.tab_ssh_dot(tab, cx),
                         active: i == self.active,

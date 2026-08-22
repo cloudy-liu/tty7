@@ -519,6 +519,39 @@ impl CLIAgent {
         None
     }
 
+    /// Identity from an interpreter's *image path*, not from argv.
+    ///
+    /// ToolHelp often shows only `node.exe`. The install directory still
+    /// names the agent (`…\cursor-agent\…\node.exe`, `…\@openai\codex\…`).
+    /// A home-folder or project directory named `claude` / `pi` / `amp`
+    /// must not count: those aliases are too short to trust as an
+    /// arbitrary path segment. Only a hyphenated alias or a scoped npm
+    /// package (`@openai/codex`) is distinctive enough.
+    pub fn detect_from_image_path_with(
+        path: &std::path::Path,
+        custom: &HashMap<String, String>,
+    ) -> Option<CLIAgent> {
+        let components: Vec<String> = path
+            .iter()
+            .map(|c| c.to_string_lossy().to_ascii_lowercase())
+            .collect();
+
+        for (i, component) in components.iter().enumerate() {
+            let stem = base_stem(component);
+            let prev = i.checked_sub(1).map(|j| components[j].as_str());
+            if !image_path_component_is_distinctive(stem, prev) {
+                continue;
+            }
+            if let Some(agent) = Self::match_token(stem) {
+                return Some(agent);
+            }
+            if let Some(agent) = custom.get(stem).and_then(|slug| CLIAgent::from_slug(slug)) {
+                return Some(agent);
+            }
+        }
+        None
+    }
+
     pub fn detect_from_command_with(
         command: &str,
         custom: &HashMap<String, String>,
@@ -574,6 +607,10 @@ fn base_stem(token: &str) -> &str {
         }
     }
     name
+}
+
+fn image_path_component_is_distinctive(stem: &str, prev: Option<&str>) -> bool {
+    stem.contains('-') || prev.is_some_and(|p| p.starts_with('@'))
 }
 
 fn is_interpreter(stem: &str) -> bool {
@@ -790,6 +827,51 @@ mod tests {
         assert_eq!(
             CLIAgent::detect_from_argv(&argv(&["FOO=1", "BAR=baz", "claude"])),
             Some(CLIAgent::Claude)
+        );
+    }
+
+    #[test]
+    fn an_interpreter_image_path_only_matches_a_distinctive_install_prefix() {
+        use std::path::Path;
+
+        assert_eq!(
+            CLIAgent::detect_from_image_path_with(
+                Path::new(r"C:\Users\me\AppData\Local\cursor-agent\versions\current\node.exe"),
+                &HashMap::new(),
+            ),
+            Some(CLIAgent::Cursor)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_image_path_with(
+                Path::new(
+                    r"C:\Users\me\AppData\Roaming\npm\node_modules\@openai\codex\vendor\node.exe"
+                ),
+                &HashMap::new(),
+            ),
+            Some(CLIAgent::Codex),
+            "a scoped npm package is an install prefix, not a folder name"
+        );
+        assert_eq!(
+            CLIAgent::detect_from_image_path_with(
+                Path::new(r"C:\Users\claude\AppData\Local\fnm\node.exe"),
+                &HashMap::new(),
+            ),
+            None,
+            "a home-directory name must not count as the agent"
+        );
+        assert_eq!(
+            CLIAgent::detect_from_image_path_with(
+                Path::new(r"C:\Users\me\pi\node.exe"),
+                &HashMap::new(),
+            ),
+            None
+        );
+        assert_eq!(
+            CLIAgent::detect_from_image_path_with(
+                Path::new(r"/Users/amp/.nvm/versions/node/v22.0.0/bin/node"),
+                &HashMap::new(),
+            ),
+            None
         );
     }
 

@@ -1,5 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
+use crate::core::cli_agent::CLIAgent;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Proc {
     pub pid: u32,
@@ -35,6 +37,51 @@ pub(crate) fn foreground_name(procs: &[Proc], shell_pid: u32) -> Option<String> 
         .into_iter()
         .max_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)))
         .map(|(_, _, name)| name.to_string())
+}
+
+const AGENT_SCAN_MAX_DEPTH: u32 = 3;
+
+fn detect_foreground_agent_with<F>(
+    procs: &[Proc],
+    shell_pid: u32,
+    image_path_for: F,
+    custom: &std::collections::HashMap<String, String>,
+) -> Option<(CLIAgent, Vec<String>)>
+where
+    F: Fn(u32) -> Option<std::path::PathBuf>,
+{
+    for (depth, pid, name) in walk(procs, shell_pid) {
+        if depth > AGENT_SCAN_MAX_DEPTH {
+            break;
+        }
+
+        let launcher = name.to_ascii_lowercase();
+        let mut agent = CLIAgent::detect_from_argv_with(std::slice::from_ref(&launcher), custom);
+        if agent.is_none()
+            && let Some(path) = image_path_for(pid)
+        {
+            // Script-installed agents often leave only a generic interpreter
+            // in ToolHelp (`node.exe`). The image path still carries the
+            // package name (`...\cursor-agent\...\node.exe`). That is not
+            // argv — feeding the whole path to the argv detector would
+            // treat a home folder named `claude` as Claude.
+            agent = CLIAgent::detect_from_image_path_with(&path, custom);
+        }
+        if let Some(agent) = agent {
+            // ToolHelp does not expose the command line. An invented argv is
+            // unsafe to replay for session resume (especially interpreter
+            // wrappers), so this probe reports identity only.
+            return Some((agent, Vec::new()));
+        }
+    }
+    None
+}
+
+pub(crate) fn foreground_agent(
+    shell_pid: u32,
+    custom: &std::collections::HashMap<String, String>,
+) -> Option<(CLIAgent, Vec<String>)> {
+    detect_foreground_agent_with(&snapshot(), shell_pid, image_path, custom)
 }
 
 pub(crate) fn snapshot() -> Vec<Proc> {
@@ -506,6 +553,88 @@ mod tests {
     fn foreground_name_breaks_depth_ties_by_pid() {
         let procs = vec![p(100, 1, "sh"), p(200, 100, "a"), p(201, 100, "b")];
         assert_eq!(foreground_name(&procs, 100).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn cmder_cursor_agent_is_found_before_its_mcp_children() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let procs = vec![
+            p(100, 1, "cmd.exe"),
+            p(200, 100, "powershell.exe"),
+            p(300, 200, "node.exe"),
+            p(400, 300, "cmd.exe"),
+            p(500, 400, "codex.exe"),
+        ];
+        let detected = detect_foreground_agent_with(
+            &procs,
+            100,
+            |pid| match pid {
+                300 => Some(PathBuf::from(
+                    r"C:\Users\me\AppData\Local\cursor-agent\versions\current\node.exe",
+                )),
+                500 => Some(PathBuf::from(r"C:\tools\codex.exe")),
+                _ => None,
+            },
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            detected.as_ref().map(|(agent, _)| *agent),
+            Some(CLIAgent::Cursor),
+            "the nearest agent owns the pane; a nested MCP command does not"
+        );
+    }
+
+    #[test]
+    fn cmder_codex_native_child_is_detected() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let procs = vec![
+            p(100, 1, "cmd.exe"),
+            p(200, 100, "node.exe"),
+            p(300, 200, "codex.exe"),
+            p(400, 300, "codex-code-mode-host.exe"),
+        ];
+        let detected = detect_foreground_agent_with(
+            &procs,
+            100,
+            |pid| {
+                (pid == 300).then(|| {
+                    PathBuf::from(
+                        r"C:\Users\me\AppData\Roaming\npm\node_modules\@openai\codex\vendor\codex.exe",
+                    )
+                })
+            },
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            detected.as_ref().map(|(agent, _)| *agent),
+            Some(CLIAgent::Codex)
+        );
+    }
+
+    #[test]
+    fn a_node_under_a_user_named_claude_is_not_the_agent() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let procs = vec![p(100, 1, "cmd.exe"), p(200, 100, "node.exe")];
+        let detected = detect_foreground_agent_with(
+            &procs,
+            100,
+            |pid| {
+                (pid == 200).then(|| PathBuf::from(r"C:\Users\claude\AppData\Local\fnm\node.exe"))
+            },
+            &HashMap::new(),
+        );
+        assert_eq!(
+            detected, None,
+            "a home-directory name is not an install prefix"
+        );
     }
 
     #[test]
