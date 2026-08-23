@@ -720,9 +720,81 @@ fn zsh_redirectors() -> [(&'static str, String); 4] {
 
 pub struct Injection {
     pub env: HashMap<String, String>,
+    /// Entries that must be added to a list-valued environment variable after
+    /// the pane's refreshed registry and configured environment are known.
+    /// Keeping the merge rule here prevents the pane layer from knowing which
+    /// shells use `CLINK_PATH`, `WSLENV`, or their separators.
+    pub env_lists: Vec<EnvListInjection>,
     pub args: Vec<String>,
     pub replaces_argv: bool,
     pub dir: Option<PathBuf>,
+}
+
+pub struct EnvListInjection {
+    pub key: String,
+    pub entries: Vec<String>,
+    pub kind: EnvListKind,
+}
+
+#[derive(Clone, Copy)]
+pub enum EnvListKind {
+    WindowsPath,
+    Wslenv,
+}
+
+impl EnvListInjection {
+    pub fn merged(&self, list: &str) -> String {
+        match self.kind {
+            EnvListKind::WindowsPath => {
+                let normalized = |entry: &str| {
+                    entry
+                        .trim()
+                        .trim_end_matches(['\\', '/'])
+                        .to_ascii_lowercase()
+                };
+                let existing: Vec<String> = list
+                    .split(';')
+                    .filter(|entry| !entry.trim().is_empty())
+                    .map(normalized)
+                    .collect();
+                let missing: Vec<&str> = self
+                    .entries
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|entry| !existing.iter().any(|item| item == &normalized(entry)))
+                    .collect();
+                if missing.is_empty() {
+                    return list.to_string();
+                }
+                let prefix = missing.join(";");
+                match list.trim().is_empty() {
+                    true => prefix,
+                    false => format!("{prefix};{list}"),
+                }
+            }
+            EnvListKind::Wslenv => {
+                let mut merged: Vec<String> = list
+                    .split(':')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                for entry in &self.entries {
+                    let name = entry.split('/').next().unwrap_or(entry);
+                    if !merged.iter().any(|existing| {
+                        existing
+                            .split('/')
+                            .next()
+                            .unwrap_or(existing)
+                            .eq_ignore_ascii_case(name)
+                    }) {
+                        merged.push(entry.clone());
+                    }
+                }
+                merged.join(":")
+            }
+        }
+    }
 }
 
 const ZDOTDIR_PREFIX: &str = "tty7-zdotdir-";
@@ -751,6 +823,8 @@ enum ShellKind {
     Fish,
     PowerShell,
     Nushell,
+    #[cfg(windows)]
+    Cmd,
     Wsl,
 }
 
@@ -770,6 +844,8 @@ fn shell_kind(program: Option<&str>) -> Option<ShellKind> {
         "fish" => Some(ShellKind::Fish),
         "powershell" | "pwsh" => Some(ShellKind::PowerShell),
         "nu" => Some(ShellKind::Nushell),
+        #[cfg(windows)]
+        "cmd" => Some(ShellKind::Cmd),
         "wsl" => Some(ShellKind::Wsl),
         _ => None,
     }
@@ -786,23 +862,6 @@ pub(crate) fn wsl_distro(args: &[String]) -> Option<String> {
         }
     }
     None
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn wslenv_with(existing: Option<&str>, additions: &[&str]) -> String {
-    let mut out: Vec<String> = existing
-        .unwrap_or("")
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    for add in additions {
-        let name = add.split('/').next().unwrap_or(add);
-        if !out.iter().any(|e| e.split('/').next().unwrap_or(e) == name) {
-            out.push((*add).to_string());
-        }
-    }
-    out.join(":")
 }
 
 fn is_msys_bash(program: &str) -> bool {
@@ -845,6 +904,7 @@ fn setup_zsh() -> Option<Injection> {
 
     Some(Injection {
         env,
+        env_lists: Vec::new(),
         args: Vec::new(),
         replaces_argv: false,
         dir: Some(dir),
@@ -854,6 +914,7 @@ fn setup_zsh() -> Option<Injection> {
 fn setup_fish() -> Option<Injection> {
     Some(Injection {
         env: HashMap::new(),
+        env_lists: Vec::new(),
         args: vec!["-C".to_string(), FISH_INTEGRATION.to_string()],
         replaces_argv: false,
         dir: None,
@@ -863,6 +924,7 @@ fn setup_fish() -> Option<Injection> {
 fn setup_powershell() -> Option<Injection> {
     Some(Injection {
         env: HashMap::new(),
+        env_lists: Vec::new(),
         args: vec![
             "-NoLogo".to_string(),
             "-NoExit".to_string(),
@@ -871,6 +933,187 @@ fn setup_powershell() -> Option<Injection> {
         ],
         replaces_argv: false,
         dir: None,
+    })
+}
+
+/// Marker inside OSC 9;9 that distinguishes tty7's cmd prompt hook from the
+/// generic Windows cwd report emitted by applications such as file managers.
+/// Only the marked form may arm the inline editor; the generic form remains a
+/// cwd update and cannot reset a running TUI's terminal modes.
+pub(crate) const CMD_OSC9_MARKER: &str = "tty7-cmd;";
+
+/// cmd.exe has no rcfile or precmd hook. A small batch file runs after AutoRun
+/// or a configured `/K init.bat`, when the user's final `PROMPT` is known, and
+/// wraps that value instead of replacing it with the stock `$P$G` prompt.
+///
+/// `$e` is ESC. ST (`$e\`) terminates OSC — cmd's prompt language has no BEL
+/// code. A and B are enough for the inline editor (ghost / Tab). There is no C
+/// (command started) or D (exit code): cmd cannot run code between Enter and
+/// the next prompt. OSC 9;9 carries `$P` as a Windows path because cmd cannot
+/// assemble an OSC 7 `file://` URI from prompt codes.
+///
+/// The first line is a re-entry guard. `PROMPT` is inherited, so a tty7 daemon
+/// that was itself launched from a tty7 cmd pane hands every new pane a
+/// `PROMPT` that already carries the marks; wrapping it again would report the
+/// same prompt cycle twice. Substring removal is how a batch file asks "does
+/// this value contain that text" without delayed expansion.
+#[cfg(windows)]
+fn cmd_prompt_wrapper() -> String {
+    format!(
+        concat!(
+            "@echo off\r\n",
+            "if not \"%PROMPT%\"==\"%PROMPT:133;A=%\" goto :eof\r\n",
+            "if not defined PROMPT set \"PROMPT=$P$G\"\r\n",
+            "set \"PROMPT=$e]133;A$e\\$e]9;9;{}$P$e\\%PROMPT%$e]133;B$e\\\"\r\n"
+        ),
+        CMD_OSC9_MARKER
+    )
+}
+
+/// Clink renders its own `clink.prompt.value` after cmd expands `%PROMPT%`, so
+/// even a trailing `prompt ...` cannot wrap a Cmder prompt. Clink deliberately
+/// loads every directory in `CLINK_PATH`; a late prompt filter lets the user's
+/// filters finish first, then adds the OSC 9;9 cwd/prompt report that Clink's
+/// renderer preserves (it consumes OSC 133 embedded in a prompt string).
+///
+/// A Clink that kept the whole `%PROMPT%` — rather than replacing it, which is
+/// what Cmder's own filters do — already carries the marker, and a second
+/// report would make one prompt cycle look like two.
+#[cfg(windows)]
+const CMD_CLINK_INTEGRATION: &str = r#"
+if clink then
+    local esc = string.char(27)
+    local st = esc .. "\\"
+    local marker = "]9;9;tty7-cmd;"
+    local function tty7_cwd()
+        local ok, cwd = pcall(function()
+            if os and os.getcwd then
+                return os.getcwd()
+            elseif clink.get_cwd then
+                return clink.get_cwd()
+            end
+            return ""
+        end)
+        if ok and type(cwd) == "string" then
+            return cwd
+        end
+        return ""
+    end
+    local function tty7_wrap_prompt(prompt)
+        prompt = prompt or ""
+        if prompt:find(marker, 1, true) then
+            return prompt
+        end
+        return esc .. marker .. tty7_cwd() .. st .. prompt
+    end
+    -- clink.print is the ANSI-aware path, but NONL (no trailing newline) only
+    -- exists from v1.2.11. io.write is the plain-Lua fallback for older ones.
+    local function tty7_emit(seq)
+        if clink.print and NONL then
+            clink.print(seq, NONL)
+        else
+            io.write(seq)
+        end
+    end
+    if clink.promptfilter then
+        local tty7_prompt = clink.promptfilter(999)
+        function tty7_prompt:filter(prompt)
+            local ok, wrapped = pcall(tty7_wrap_prompt, prompt)
+            return ok and wrapped or prompt
+        end
+    elseif clink.prompt and clink.prompt.register_filter then
+        local function tty7_prompt_filter()
+            local ok, wrapped = pcall(tty7_wrap_prompt, clink.prompt.value)
+            if ok then
+                clink.prompt.value = wrapped
+            end
+        end
+        clink.prompt.register_filter(tty7_prompt_filter, 999)
+    end
+    -- C (command started). cmd itself cannot run code between Enter and the
+    -- next prompt, which is why the batch hook reports no C at all; without one
+    -- the pane stays "at a prompt" for the entire run of whatever was
+    -- submitted, and tty7's inline editor draws over a full-screen program's
+    -- own input line. Clink can report it: onendedit fires with the submitted
+    -- text the moment the edit session ends, which is exactly preexec.
+    --
+    -- Gated on onfilterinput, which is what v1.2.16 split the "replace the
+    -- user's input" job into. On an older Clink onendedit's *return value* is
+    -- that replacement, and a handler returning nothing would erase the line
+    -- it was only meant to observe.
+    --
+    -- No D: exit codes come from os.geterrorlevel(), which returns 0 unless
+    -- cmd.get_errorlevel is enabled, so reporting one would mark every failed
+    -- command as a success. The prompt's own OSC 9;9 ends the cycle instead.
+    if clink.onendedit and clink.onfilterinput then
+        clink.onendedit(function(line)
+            pcall(function()
+                if type(line) ~= "string" or line:match("^%s*$") then
+                    return
+                end
+                -- Percent-encode what would otherwise break OSC framing or the
+                -- daemon's own decode. `%` goes first: the rest introduce it.
+                local cmd = line:sub(1, 512)
+                cmd = cmd:gsub("%%", "%%25")
+                cmd = cmd:gsub("\27", "%%1B")
+                cmd = cmd:gsub("\7", "%%07")
+                cmd = cmd:gsub("\r", "%%0D")
+                cmd = cmd:gsub("\n", "%%0A")
+                tty7_emit(esc .. "]133;C;" .. cmd .. st)
+            end)
+        end)
+    end
+end
+"#;
+
+#[cfg(windows)]
+fn setup_cmd() -> Option<Injection> {
+    let dir = throwaway_dir("tty7-cmd-")?;
+    let prompt_script = dir.join("prompt.cmd");
+    if std::fs::write(&prompt_script, cmd_prompt_wrapper()).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    let mut env_lists = Vec::new();
+    if std::fs::write(dir.join("tty7.lua"), CMD_CLINK_INTEGRATION).is_ok() {
+        env_lists.push(EnvListInjection {
+            key: "CLINK_PATH".to_string(),
+            entries: vec![dir.to_string_lossy().into_owned()],
+            kind: EnvListKind::WindowsPath,
+        });
+    }
+    let prompt_script = prompt_script.to_string_lossy().into_owned();
+    Some(Injection {
+        env: HashMap::new(),
+        env_lists,
+        // `/K call prompt.cmd` runs after AutoRun and keeps the shell open.
+        args: vec!["/K".to_string(), "call".to_string(), prompt_script],
+        replaces_argv: false,
+        dir: Some(dir),
+    })
+}
+
+/// Cmder-style custom cmd launches already own `/K init.bat`, so tty7 cannot
+/// append a prompt script without changing the user's command line. Clink can
+/// still load tty7's Lua through `CLINK_PATH`, which gives those launches the
+/// prompt lifecycle while leaving every argv element untouched.
+#[cfg(windows)]
+fn setup_custom_cmd() -> Option<Injection> {
+    let dir = throwaway_dir("tty7-cmd-")?;
+    if std::fs::write(dir.join("tty7.lua"), CMD_CLINK_INTEGRATION).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    Some(Injection {
+        env: HashMap::new(),
+        env_lists: vec![EnvListInjection {
+            key: "CLINK_PATH".to_string(),
+            entries: vec![dir.to_string_lossy().into_owned()],
+            kind: EnvListKind::WindowsPath,
+        }],
+        args: Vec::new(),
+        replaces_argv: false,
+        dir: Some(dir),
     })
 }
 
@@ -896,6 +1139,7 @@ fn setup_nushell_with(user_config: Option<&Path>) -> Option<Injection> {
 
     Some(Injection {
         env: HashMap::new(),
+        env_lists: Vec::new(),
         args: vec![
             "--config".to_string(),
             config.to_string_lossy().into_owned(),
@@ -1077,6 +1321,7 @@ fn setup_bash() -> Option<Injection> {
 
     Some(Injection {
         env: HashMap::new(),
+        env_lists: Vec::new(),
         args: vec!["--rcfile".to_string(), bash_path(&rcfile), "-i".to_string()],
         replaces_argv: true,
         dir: Some(dir),
@@ -1155,7 +1400,7 @@ fn wsl_exec_script() -> String {
 /// — the distro's own home — and its `.zshenv` arm recaptures a relocated
 /// `ZDOTDIR` from in there, which is the only side that ever knew it.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn wsl_integration_env(dir: &Path, wslenv: Option<&str>) -> Option<HashMap<String, String>> {
+fn wsl_integration_env(dir: &Path) -> Option<(HashMap<String, String>, Vec<String>)> {
     let rcfile = dir.join("bashrc");
     std::fs::write(&rcfile, bash_rcfile()).ok()?;
 
@@ -1176,9 +1421,7 @@ fn wsl_integration_env(dir: &Path, wslenv: Option<&str>) -> Option<HashMap<Strin
         names.push(format!("{WSL_ZDOTDIR_ENV}/p"));
     }
 
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    env.insert("WSLENV".to_string(), wslenv_with(wslenv, &names));
-    Some(env)
+    Some((env, names))
 }
 
 /// The zsh redirectors, under the pane's own throwaway directory so that the
@@ -1197,7 +1440,7 @@ fn wsl_zdotdir(dir: &Path) -> Option<String> {
 fn setup_wsl(args: &[String]) -> Option<Injection> {
     let distro = wsl_distro(args);
     let dir = throwaway_dir("tty7-wslrc-")?;
-    let env = wsl_integration_env(&dir, std::env::var("WSLENV").ok().as_deref())?;
+    let (env, wslenv_entries) = wsl_integration_env(&dir)?;
 
     let mut argv: Vec<String> = Vec::new();
     if let Some(d) = &distro {
@@ -1218,6 +1461,11 @@ fn setup_wsl(args: &[String]) -> Option<Injection> {
 
     Some(Injection {
         env,
+        env_lists: vec![EnvListInjection {
+            key: "WSLENV".to_string(),
+            entries: wslenv_entries,
+            kind: EnvListKind::Wslenv,
+        }],
         args: argv,
         replaces_argv: true,
         dir: Some(dir),
@@ -1240,26 +1488,35 @@ fn wsl_cd(args: &[String]) -> Option<String> {
 
 #[cfg_attr(not(windows), allow(unused_variables))]
 pub fn setup(program: Option<&str>, args: &[String], has_custom_args: bool) -> Option<Injection> {
-    // Every shell defers to user-authored args, so the gate sits ahead of the
-    // dispatch rather than once per arm — a shell added below inherits it
-    // instead of having to remember it. Argv injection would collide with those
-    // args outright, and even zsh's env-only ZDOTDIR swap changes which startup
-    // files run. Arguments tty7's own detection supplied (Git Bash's `-i -l`,
-    // a WSL row's `--distribution`) are not user-authored and never land here;
-    // `daemon::pane::has_custom_args` is where that line is drawn.
-    if has_custom_args {
-        return None;
-    }
-    let mut injection = match shell_kind(program)? {
-        ShellKind::Zsh => setup_zsh(),
-        ShellKind::Fish => setup_fish(),
-        ShellKind::Bash => setup_bash(),
-        ShellKind::PowerShell => setup_powershell(),
-        ShellKind::Nushell => setup_nushell(),
-        #[cfg(windows)]
-        ShellKind::Wsl => setup_wsl(args),
-        #[cfg(not(windows))]
-        ShellKind::Wsl => None,
+    // User-authored argv is an opaque launch contract. Rewriting it would
+    // collide with shell startup flags and, for cmd.exe in particular, cannot
+    // preserve batch operators, quoting, expansion, and empty arguments.
+    // Most custom launches therefore skip integration. Custom cmd is the safe
+    // exception: Clink can discover tty7's Lua through the environment without
+    // changing argv. tty7's own detected args (Git Bash's `-i -l`, a WSL row's
+    // `--distribution`) are not user-authored; `daemon::pane::has_custom_args`
+    // draws that line.
+    let kind = shell_kind(program)?;
+    let mut injection = if has_custom_args {
+        match kind {
+            #[cfg(windows)]
+            ShellKind::Cmd => setup_custom_cmd(),
+            _ => None,
+        }
+    } else {
+        match kind {
+            ShellKind::Zsh => setup_zsh(),
+            ShellKind::Fish => setup_fish(),
+            ShellKind::Bash => setup_bash(),
+            ShellKind::PowerShell => setup_powershell(),
+            ShellKind::Nushell => setup_nushell(),
+            #[cfg(windows)]
+            ShellKind::Cmd => setup_cmd(),
+            #[cfg(windows)]
+            ShellKind::Wsl => setup_wsl(args),
+            #[cfg(not(windows))]
+            ShellKind::Wsl => None,
+        }
     }?;
 
     injection
@@ -1568,6 +1825,23 @@ fi
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    struct RemoveDirOnDrop(Option<PathBuf>);
+
+    #[cfg(windows)]
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.take() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn remove_injection_dir_on_drop(injection: &Injection) -> RemoveDirOnDrop {
+        RemoveDirOnDrop(injection.dir.clone())
+    }
+
     #[test]
     fn edit_mode_detection_survives_rebound_escape_and_inputrc() {
         assert!(
@@ -1613,6 +1887,21 @@ mod tests {
         keys: &[u8],
         cwd: Option<&Path>,
     ) -> String {
+        transcript_over_pty(program, injection, keys, cwd, |typed, text| {
+            typed && text.contains(FAILED_COMMAND_MARK)
+        })
+    }
+
+    /// One attempt at [`transcript_over_pty`]. `None` means the shell never
+    /// reached a prompt, so nothing was typed and the transcript describes a
+    /// startup that did not happen rather than the cycle under test.
+    fn transcript_over_pty_once(
+        program: &str,
+        injection: &Injection,
+        keys: &[u8],
+        cwd: Option<&Path>,
+        done: &dyn Fn(bool, &str) -> bool,
+    ) -> Result<String, String> {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         use std::io::{Read, Write};
 
@@ -1628,6 +1917,15 @@ mod tests {
         cmd.args(&injection.args);
         for (k, v) in &injection.env {
             cmd.env(k, v);
+        }
+        for list in &injection.env_lists {
+            let current = cmd
+                .get_env(&list.key)
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+                .or_else(|| std::env::var(&list.key).ok())
+                .unwrap_or_default();
+            cmd.env(&list.key, list.merged(&current));
         }
         if let Some(dir) = cwd {
             cmd.cwd(dir);
@@ -1651,7 +1949,7 @@ mod tests {
         let mut out = Vec::new();
         let mut answered = 0usize;
         let mut typed = false;
-        let mut seen_fail = None;
+        let mut seen_done = None;
         while std::time::Instant::now() < deadline {
             match rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(chunk) => out.extend_from_slice(&chunk),
@@ -1684,24 +1982,34 @@ mod tests {
             // waiting on that reply — eats `false\r` as the answer to its own
             // query. The command then never runs, and the failure reads as a
             // missing C mark rather than as the race it is.
-            if !typed && (text.contains("133;A") || text.contains("133;B")) {
+            //
+            // cmd under Clink is the one integrated shell that reports no 133
+            // at all: Clink renders its own prompt and drops the OSC 133 that
+            // tty7's `%PROMPT%` carried, leaving the marked OSC 9;9 as the
+            // whole prompt-start signal. No other shell emits that marker, so
+            // this arm is inert for them.
+            if !typed
+                && (text.contains("133;A")
+                    || text.contains("133;B")
+                    || text.contains(&format!("9;9;{CMD_OSC9_MARKER}")))
+            {
                 writer.write_all(keys).expect("write");
                 writer.flush().expect("flush");
                 typed = true;
             }
 
-            // Stop only once the typed command's own D report lands. A shell can
-            // emit an unpaired D while drawing its first prompt, and breaking on
-            // that would sample the transcript before the prompt cycle under test
-            // has run at all.
-            if typed && text.contains(FAILED_COMMAND_MARK) && seen_fail.is_none() {
-                seen_fail = Some(std::time::Instant::now());
+            // Stop only once the typed command's own completion lands. A shell
+            // can emit an unpaired D while drawing its first prompt, and
+            // breaking on that would sample the transcript before the prompt
+            // cycle under test has run at all.
+            if done(typed, &text) && seen_done.is_none() {
+                seen_done = Some(std::time::Instant::now());
             }
             // The D mark and the rest of the same prompt cycle (the cwd report,
             // the A mark) are separate writes: breaking the moment the mark
             // arrives can sample the transcript before the report does. Hold
             // the pty open briefly so the cycle's tail lands.
-            if let Some(at) = seen_fail {
+            if let Some(at) = seen_done {
                 if at.elapsed() >= std::time::Duration::from_millis(500) {
                     break;
                 }
@@ -1712,12 +2020,111 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         drop(pty.master);
-        assert!(
-            typed,
-            "no prompt-start mark ever arrived, so nothing was typed; got:\n{}",
-            String::from_utf8_lossy(&out)
-        );
-        String::from_utf8_lossy(&out).into_owned()
+        let text = String::from_utf8_lossy(&out).into_owned();
+        match typed {
+            true => Ok(text),
+            false => Err(text),
+        }
+    }
+
+    /// Drive `program` through a real pty and return what it wrote.
+    ///
+    /// Retried once, and only when the child wrote nothing but the terminal's
+    /// own mode handshake. That failure is not the shell's doing: a ConPTY
+    /// spawned while a previous test's is still tearing down occasionally
+    /// carries no output at all for the whole window, and the transcript then
+    /// says nothing about the integration under test. A shell that did print —
+    /// an unmarked `$ `, say — reached a prompt without the integration
+    /// installed, which is a real failure and is reported on the first attempt
+    /// rather than after paying the timeout twice.
+    fn transcript_over_pty(
+        program: &str,
+        injection: &Injection,
+        keys: &[u8],
+        cwd: Option<&Path>,
+        done: impl Fn(bool, &str) -> bool,
+    ) -> String {
+        let fail = |attempts: &[&str]| -> ! {
+            panic!(
+                "no prompt-start mark ever arrived, so nothing was typed; argv={:?}\n{}",
+                injection.args,
+                attempts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| format!("attempt {}:\n{text}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let first = match transcript_over_pty_once(program, injection, keys, cwd, &done) {
+            Ok(text) => return text,
+            Err(text) => text,
+        };
+        if !only_terminal_handshake(&first) {
+            fail(&[&first]);
+        }
+        match transcript_over_pty_once(program, injection, keys, cwd, &done) {
+            Ok(text) => text,
+            Err(second) => fail(&[&first, &second]),
+        }
+    }
+
+    /// Whether a transcript holds nothing but escape sequences — the ConPTY's
+    /// own startup handshake is written by the pty rather than the child, so a
+    /// transcript with no printable character in it means the child never wrote
+    /// anything at all.
+    fn only_terminal_handshake(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != 0x1b {
+                if bytes[i].is_ascii_graphic() {
+                    return false;
+                }
+                i += 1;
+                continue;
+            }
+            i += 1;
+            match bytes.get(i) {
+                // CSI: parameter and intermediate bytes, then one final byte.
+                // The `[` itself is in the final-byte range, so it has to be
+                // stepped over before the scan starts.
+                Some(b'[') => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // OSC and the other string families run to BEL or ST.
+                Some(b']' | b'P' | b'^' | b'_') => {
+                    i += 1;
+                    while i < bytes.len() && !matches!(bytes[i], 0x07 | 0x1b) {
+                        i += 1;
+                    }
+                    // ST is `ESC \`: step over both bytes.
+                    i += usize::from(bytes.get(i) == Some(&0x1b)) + 1;
+                }
+                // Anything else is a two-byte escape.
+                _ => i += 1,
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn only_terminal_handshake_separates_a_dead_conpty_from_a_bare_prompt() {
+        // What a ConPTY that carried no child output looks like.
+        assert!(only_terminal_handshake(
+            "\u{1b}[1t\u{1b}[c\u{1b}[?1004h\u{1b}[?9001h"
+        ));
+        assert!(only_terminal_handshake(""));
+        // A shell that reached an unmarked prompt: a real integration failure,
+        // and no reason to pay the timeout a second time.
+        assert!(!only_terminal_handshake(
+            "\u{1b}[1t\u{1b}[c\u{1b}[?1004h\u{1b}[?9001h$ "
+        ));
+        assert!(!only_terminal_handshake("\u{1b}]0;title\u{7}C:\\work>"));
     }
 
     fn reported_cwd(text: &str) -> PathBuf {
@@ -1765,6 +2172,60 @@ mod tests {
             cwd.exists(),
             "Git Bash reported a cwd the Windows side cannot resolve: {cwd:?} \
              — a drive-relative msys path, so `pwd -W` translation regressed"
+        );
+    }
+
+    #[cfg(windows)]
+    fn reported_osc9_cwd(text: &str) -> PathBuf {
+        let payload = text
+            .split("\u{1b}]")
+            .find(|s| s.starts_with("9;9;"))
+            .and_then(|s| s.split(['\u{7}', '\u{1b}']).next())
+            .unwrap_or_else(|| panic!("expected OSC 9;9; got:\n{text}"));
+        crate::daemon::pane::parse_osc9_cwd(payload.as_bytes())
+            .unwrap_or_else(|| panic!("daemon could not parse OSC 9;9 payload {payload:?}"))
+    }
+
+    /// cmd.exe has no C/D marks. A and B plus OSC 9;9 are the whole integration:
+    /// enough for the inline editor to arm, and enough for cwd to track `$P`.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_reports_prompt_marks_over_a_real_pty() {
+        let cmd =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        if !std::path::Path::new(&cmd).is_file() {
+            eprintln!("skipping: cmd.exe not found at {cmd}");
+            return;
+        }
+        let mut injection = setup(Some(&cmd), &[], false).expect("cmd integration");
+        let _cleanup = remove_injection_dir_on_drop(&injection);
+        // AutoRun can `prompt` over our PROMPT. The production spawn does not
+        // pass /D; the test does so a machine hook cannot fail the round-trip.
+        injection.args.insert(0, "/D".into());
+        let text = transcript_over_pty(
+            &cmd,
+            &injection,
+            b"echo tty7-cmd-probe\r",
+            None,
+            |typed, text| {
+                typed && text.contains("tty7-cmd-probe") && text.matches("133;B").count() >= 2
+            },
+        );
+
+        for mark in ["133;A", "133;B"] {
+            assert!(
+                text.contains(mark),
+                "cmd.exe must report {mark:?}; got:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("tty7-cmd-probe"),
+            "typed echo never ran; got:\n{text}"
+        );
+        let cwd = reported_osc9_cwd(&text);
+        assert!(
+            cwd.is_absolute() && cwd.exists(),
+            "OSC 9;9 must name a real Windows path, got {cwd:?}; transcript:\n{text}"
         );
     }
 
@@ -1908,7 +2369,15 @@ mod tests {
             );
         }
         assert!(shell_kind(Some("/bin/sh")).is_none());
-        assert!(shell_kind(Some("cmd.exe")).is_none());
+        #[cfg(windows)]
+        {
+            for prog in ["cmd.exe", "cmd", "CMD.EXE", r"C:\Windows\System32\cmd.exe"] {
+                assert!(
+                    matches!(shell_kind(Some(prog)), Some(ShellKind::Cmd)),
+                    "{prog} should map to Cmd"
+                );
+            }
+        }
         assert!(matches!(shell_kind(Some("wsl.exe")), Some(ShellKind::Wsl)));
         assert!(matches!(shell_kind(Some("wsl")), Some(ShellKind::Wsl)));
     }
@@ -1987,7 +2456,7 @@ mod tests {
     #[test]
     fn wsl_integration_env_writes_what_each_shell_reads_and_names_it_for_the_distro() {
         let dir = throwaway_dir("tty7-wsltest-").expect("temp dir");
-        let env = wsl_integration_env(&dir, None).expect("integration files");
+        let (env, wslenv_entries) = wsl_integration_env(&dir).expect("integration files");
 
         let rcfile = PathBuf::from(env.get(WSL_RCFILE_ENV).expect("TTY7_RC"));
         assert_eq!(std::fs::read_to_string(&rcfile).unwrap(), bash_rcfile());
@@ -2002,7 +2471,7 @@ mod tests {
 
         // Both are Windows paths — `/p` is what turns them into the distro's
         // view of themselves, so neither may be pre-translated here.
-        assert_eq!(env.get("WSLENV").unwrap(), "TTY7_RC/p:TTY7_ZDOTDIR/p");
+        assert_eq!(wslenv_entries, ["TTY7_RC/p", "TTY7_ZDOTDIR/p"]);
         assert!(!env.contains_key("TTY7_USER_ZDOTDIR"));
         assert!(!env.contains_key("ZDOTDIR"));
 
@@ -2131,21 +2600,21 @@ mod tests {
 
     #[test]
     fn wslenv_preserves_the_users_own_entries() {
-        assert_eq!(
-            wslenv_with(Some("MYVAR/p:OTHER"), &["TTY7_RC/p"]),
-            "MYVAR/p:OTHER:TTY7_RC/p"
-        );
-        assert_eq!(wslenv_with(None, &["TTY7_RC/p"]), "TTY7_RC/p");
-        assert_eq!(wslenv_with(Some(""), &["TTY7_RC/p"]), "TTY7_RC/p");
-        assert_eq!(wslenv_with(Some("TTY7_RC/l"), &["TTY7_RC/p"]), "TTY7_RC/l");
-        assert_eq!(
-            wslenv_with(None, &["TTY7_RC/p", "TTY7_ZDOTDIR/p"]),
-            "TTY7_RC/p:TTY7_ZDOTDIR/p"
-        );
-        assert_eq!(
-            wslenv_with(Some("TTY7_ZDOTDIR/l"), &["TTY7_RC/p", "TTY7_ZDOTDIR/p"]),
-            "TTY7_ZDOTDIR/l:TTY7_RC/p"
-        );
+        let one = EnvListInjection {
+            key: "WSLENV".to_string(),
+            entries: vec!["TTY7_RC/p".to_string()],
+            kind: EnvListKind::Wslenv,
+        };
+        assert_eq!(one.merged("MYVAR/p:OTHER"), "MYVAR/p:OTHER:TTY7_RC/p");
+        assert_eq!(one.merged(""), "TTY7_RC/p");
+        assert_eq!(one.merged("TTY7_RC/l"), "TTY7_RC/l");
+        let both = EnvListInjection {
+            key: "WSLENV".to_string(),
+            entries: vec!["TTY7_RC/p".to_string(), "TTY7_ZDOTDIR/p".to_string()],
+            kind: EnvListKind::Wslenv,
+        };
+        assert_eq!(both.merged(""), "TTY7_RC/p:TTY7_ZDOTDIR/p");
+        assert_eq!(both.merged("TTY7_ZDOTDIR/l"), "TTY7_ZDOTDIR/l:TTY7_RC/p");
     }
 
     #[test]
@@ -2584,7 +3053,94 @@ mod tests {
 
         assert!(setup(Some("nu.exe"), &[], true).is_none());
 
+        #[cfg(windows)]
+        {
+            let inj = setup(Some("cmd.exe"), &[], false).expect("cmd setup");
+            let _cleanup = remove_injection_dir_on_drop(&inj);
+            assert!(inj.env.contains_key("TTY7_SHELL_INTEGRATION"));
+            assert_eq!(inj.args[0..2], ["/K", "call"]);
+            assert!(!inj.replaces_argv);
+            assert!(inj.dir.is_some());
+            assert_eq!(inj.env_lists[0].key, "CLINK_PATH");
+        }
+
+        #[cfg(not(windows))]
+        assert!(setup(Some("cmd"), &[], false).is_none());
+
         assert!(setup(Some("/bin/sh"), &[], false).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_custom_k_uses_env_only_clink_integration_without_rewriting_argv() {
+        let args = vec!["/K".to_string(), r"D:\cmder\vendor\init.bat".to_string()];
+        let injection = setup(Some("cmd.exe"), &args, true)
+            .expect("custom cmd should receive env-only Clink integration");
+        let _cleanup = remove_injection_dir_on_drop(&injection);
+
+        assert!(
+            injection.args.is_empty(),
+            "user argv must not be appended to"
+        );
+        assert!(!injection.replaces_argv, "user argv must not be replaced");
+        assert_eq!(injection.env_lists.len(), 1);
+        assert_eq!(injection.env_lists[0].key, "CLINK_PATH");
+        assert!(
+            injection
+                .dir
+                .as_ref()
+                .is_some_and(|dir| dir.join("tty7.lua").is_file()),
+            "the env-only integration must provide the Clink script"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn setup_cmd_wraps_the_stock_prompt_with_osc_marks() {
+        let inj = setup_cmd().expect("cmd injection is infallible");
+        let _cleanup = remove_injection_dir_on_drop(&inj);
+        let dir = inj.dir.as_ref().expect("cmd integration directory");
+        let prompt = std::fs::read_to_string(dir.join("prompt.cmd")).expect("prompt wrapper");
+        assert!(prompt.contains("133;A"));
+        assert!(prompt.contains("133;B"));
+        assert!(prompt.contains(&format!("9;9;{CMD_OSC9_MARKER}$P")));
+        assert!(prompt.contains("if not defined PROMPT"));
+        assert!(
+            prompt.contains(r#"if not "%PROMPT%"=="%PROMPT:133;A=%" goto :eof"#),
+            "an inherited already-wrapped PROMPT must not be wrapped twice"
+        );
+        assert!(
+            prompt.contains("%PROMPT%"),
+            "the user's final prompt is wrapped"
+        );
+        assert!(
+            prompt.contains("$e\\"),
+            "cmd has no BEL prompt code; OSC must terminate with ST"
+        );
+        assert!(!prompt.contains("133;C"), "cmd has no preexec hook");
+        assert_eq!(inj.args[0..2], ["/K", "call"]);
+        assert!(inj.args[2].ends_with("prompt.cmd"));
+        assert_eq!(inj.env_lists[0].key, "CLINK_PATH");
+        assert_eq!(inj.env_lists[0].entries, [dir.to_string_lossy()]);
+        let lua = std::fs::read_to_string(dir.join("tty7.lua")).expect("Clink script");
+        assert!(lua.contains(&format!("]9;9;{CMD_OSC9_MARKER}")));
+        assert!(lua.contains("os.getcwd"));
+        assert!(lua.contains("pcall"));
+        assert!(lua.contains("clink.promptfilter(999)"));
+        assert!(
+            lua.contains("clink.onendedit") && lua.contains("]133;C;"),
+            "cmd cannot report command start on its own; Clink is the only \
+             place a cmd pane can say a full-screen program took the line"
+        );
+        assert!(
+            lua.contains("clink.onfilterinput"),
+            "onendedit's return value replaced the user's input before v1.2.16"
+        );
+        assert!(
+            !lua.contains("]133;D"),
+            "exit codes are 0 unless cmd.get_errorlevel is on, so no D is sent"
+        );
+        assert!(!inj.replaces_argv);
     }
 
     #[test]

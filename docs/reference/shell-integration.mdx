@@ -19,6 +19,7 @@ removes itself from the equation if you run the same shell elsewhere.
 | **bash** | An rcfile that sources your own first. |
 | **fish** | A `-C` init command. |
 | **PowerShell** | An encoded init command that wraps your existing `prompt` function and PSReadLine's line reader. |
+| **CMD / Clink** *(Windows)* | A prompt wrapper for stock `cmd.exe`; when Clink is present (including Cmder), a Lua hook adds command-start reporting without replacing the user's prompt. |
 | **WSL** *(Windows)* | The distro's shell is bootstrapped with the same scripts. |
 | **Remote panes** | The same three POSIX shells, bootstrapped over the SSH connection. Toggle per profile with **Settings → SSH → Session → Shell integration**. |
 
@@ -26,11 +27,15 @@ removes itself from the equation if you run the same shell elsewhere.
 injection when shells nest.
 
 <Note>
-  A shell launched with arguments *you* wrote — `shell.args`, or a
-  `custom_shells` entry — is left alone, because tty7's injection would
-  conflict with the flags you chose. Arguments tty7's own detection supplied
-  (Git Bash's `-i -l`, a WSL row's `--distribution`) do not count, so those
-  rows are still integrated.
+  Arguments *you* wrote — `shell.args`, or a `custom_shells` entry — are always
+  launched verbatim. Most such launches skip integration because injecting
+  startup flags would conflict with the flags you chose. Custom `cmd.exe`
+  launches are the exception: tty7 can add its Clink script through
+  `CLINK_PATH` without changing argv. This works when the custom startup loads
+  Clink, as Cmder does; a plain `/K init.bat` without Clink remains
+  uninstrumented. Arguments tty7's own detection supplied (Git Bash's `-i -l`,
+  a WSL row's `--distribution`) do not count, so those rows are still fully
+  integrated.
 </Note>
 
 ## What it reports
@@ -43,6 +48,12 @@ injection when shells nest.
 | Working directory | `OSC 7` | New tabs and splits opening in the right place, the sidebar's repo grouping, the git branch readout |
 | Editing mode (vi / emacs) | `OSC 133;V` | Matching tty7's key handling to your shell's mode |
 | Window title | `OSC 0` | Tab labels. Only PowerShell is given this — zsh, bash, and fish already set a title of their own, and tty7 reads whatever they emit |
+
+Stock CMD reports prompt boundaries and cwd but has no hook between pressing
+Enter and the next prompt. tty7 uses the Windows process tree while a command
+is running. Clink adds the command-start signal. CMD does not report reliable
+exit codes, so failure marks and exit-code-based notifications are unavailable
+there.
 
 ## What turns off without it
 

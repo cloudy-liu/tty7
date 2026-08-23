@@ -232,8 +232,60 @@ fn build_shell_command(
     }
     let integration_dir = integration.as_ref().and_then(|i| i.dir.clone());
     let launched = launched_shell_program(&cmd, &resolved_program);
-    apply_common_command_setup(&mut cmd, initial_cwd, pane, workspace, &launched);
+    let extra_env = crate::core::config::extra_env();
+    apply_common_command_setup(
+        &mut cmd,
+        initial_cwd,
+        pane,
+        workspace,
+        &launched,
+        &extra_env,
+    );
+    // The Windows registry refresh runs after integration setup. Reapply
+    // integration-owned values without outranking an explicit tty7 `env`
+    // override, and merge list-valued additions with the pane's final value.
+    if let Some(integration) = &integration {
+        pin_integration_env(&mut cmd, integration, &extra_env);
+    }
     Ok((cmd, integration_dir))
+}
+
+fn pin_integration_env(
+    cmd: &mut CommandBuilder,
+    integration: &shell_integration::Injection,
+    extra_env: &std::collections::HashMap<String, String>,
+) {
+    for (k, v) in &integration.env {
+        if configured_env_value(extra_env, k).is_none() {
+            cmd.env(k, v);
+        }
+    }
+    for list in &integration.env_lists {
+        let current = configured_env_value(extra_env, &list.key)
+            .cloned()
+            .or_else(|| {
+                cmd.get_env(&list.key)
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| std::env::var(&list.key).ok())
+            .unwrap_or_default();
+        cmd.env(&list.key, list.merged(&current));
+    }
+}
+
+fn configured_env_value<'a>(
+    extra_env: &'a std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<&'a String> {
+    extra_env.iter().find_map(|(candidate, value)| {
+        let same = if cfg!(windows) {
+            candidate.eq_ignore_ascii_case(key)
+        } else {
+            candidate == key
+        };
+        same.then_some(value)
+    })
 }
 
 /// The program the pane is really about to exec.
@@ -535,6 +587,7 @@ fn apply_common_command_setup(
     pane: u64,
     workspace: Option<&str>,
     shell: &str,
+    extra_env: &std::collections::HashMap<String, String>,
 ) {
     if let Some(dir) = initial_cwd {
         cmd.cwd(dir);
@@ -559,8 +612,6 @@ fn apply_common_command_setup(
         #[cfg(unix)]
         cmd.env("PWD", dir);
     }
-    let extra_env = crate::core::config::extra_env();
-
     // Windows hands every process a private copy of the environment at spawn
     // time and never updates it, so a daemon that has been running since before
     // an installer touched `HKCU\Environment` would give a brand-new pane its
@@ -568,17 +619,17 @@ fn apply_common_command_setup(
     // command; the pane-specific variables below (and the configured overrides
     // they carry) are applied afterwards and still win.
     #[cfg(windows)]
-    for (k, v) in crate::daemon::windows_env::refreshed_pane_environment(&extra_env) {
+    for (k, v) in crate::daemon::windows_env::refreshed_pane_environment(extra_env) {
         cmd.env(k, v);
     }
 
     let dark = crate::core::machine::appearance().dark;
-    for (k, v) in pane_environment(&extra_env, dark, pane, workspace, shell) {
+    for (k, v) in pane_environment(extra_env, dark, pane, workspace, shell) {
         cmd.env(k, v);
     }
 
     #[cfg(target_os = "macos")]
-    if locale_fallback_is_needed(&extra_env, |key| std::env::var(key).ok())
+    if locale_fallback_is_needed(extra_env, |key| std::env::var(key).ok())
         && let Some(locale) = character_locale(system_locale_identifier().as_deref(), |name| {
             std::path::Path::new(LOCALE_DEFINITION_DIR)
                 .join(name)
@@ -1469,7 +1520,9 @@ impl DaemonPane {
             gate,
             reader_handle,
             writer.clone(),
-            move || foreground_command_running(&fg_master, shell_pid),
+            move |reports_command_start| {
+                foreground_command_running(&fg_master, shell_pid, reports_command_start)
+            },
             ForegroundProbes {
                 remote: Box::new(move || foreground_remote_context(&remote_master)),
                 agent: Box::new(move || {
@@ -1679,7 +1732,7 @@ impl DaemonPane {
             gate,
             reader_handle,
             writer.clone(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -1725,7 +1778,7 @@ impl DaemonPane {
         // query replies (`\x1b_G…;OK\x1b\\`) straight back to the PTY — see the
         // graphics sniff in the loop below.
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
-        foreground_running: impl Fn() -> bool + Send + 'static,
+        foreground_running: impl Fn(bool) -> bool + Send + 'static,
         probes: ForegroundProbes,
         death: Arc<DeathReporter>,
     ) -> JoinHandle<()> {
@@ -1860,7 +1913,9 @@ impl DaemonPane {
                             // cwd/prompt change to emit while we hold the lock.
                             let mut signals = sniffer.feed(bytes);
 
-                            if signals.shell.iter().any(|s| s.at_prompt) && foreground_running() {
+                            if signals.shell.iter().any(|s| s.at_prompt)
+                                && foreground_running(sniffer.reports_command_start())
+                            {
                                 for s in signals.shell.iter_mut() {
                                     s.at_prompt = false;
                                 }
@@ -1872,6 +1927,24 @@ impl DaemonPane {
                                 next_remote_check =
                                     std::time::Instant::now() + REMOTE_CONTEXT_POLL_INTERVAL;
                             }
+
+                            // The guard above can only refuse to arm the editor
+                            // at the moment a prompt mark arrives. A shell that
+                            // reports no command start emits nothing when the
+                            // user presses Enter, so nothing re-evaluates the
+                            // pane for the whole run of what was submitted —
+                            // bare cmd hands a full-screen program the line and
+                            // tty7 keeps drawing over it. Ask the process tree
+                            // on the probe cadence instead. The next prompt's
+                            // own report is what arms the editor again.
+                            if poll_now
+                                && sniffer.shell.at_prompt
+                                && foreground_running(sniffer.reports_command_start())
+                            {
+                                sniffer.shell.at_prompt = false;
+                                signals.shell.push(sniffer.shell.clone());
+                            }
+
                             let remote = if poll_now {
                                 let managed = {
                                     let st = state.lock().unwrap();
@@ -2737,11 +2810,36 @@ fn stamp_launch_argv(st: &mut PaneState, argv: Option<Vec<String>>) {
     }
 }
 
+/// Whether something other than the shell itself is running in the pane.
+///
+/// `reports_command_start` says whether this pane's shell reports OSC 133 C.
+/// Unix ignores it: the pty's foreground process group is an exact answer and
+/// is always available. Windows has no such thing under ConPTY, and falls back
+/// to the process tree — but only for a shell that cannot say for itself, which
+/// in practice means cmd. A shell that does report C already knows when it is
+/// busy, and asking the tree on its behalf would misread the short-lived
+/// helpers a prompt spawns (Cmder runs `git` for its own prompt) as a command.
 fn foreground_command_running(
     master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
     shell_pid: Option<u32>,
+    reports_command_start: bool,
 ) -> bool {
+    #[cfg(windows)]
+    if !reports_command_start {
+        return shell_pid.is_some_and(shell_has_child_process);
+    }
+    let _ = reports_command_start;
     is_foreground_command(pty_foreground_pgid(master), shell_pid)
+}
+
+/// The Windows stand-in for "the foreground process group is not the shell".
+///
+/// Only consulted when a prompt mark arrives — once or twice per prompt cycle,
+/// never on the per-chunk output path — so the full-system snapshot it costs
+/// is paid at human rather than terminal rates.
+#[cfg(windows)]
+fn shell_has_child_process(shell_pid: u32) -> bool {
+    !crate::daemon::winproc::descendants(&crate::daemon::winproc::snapshot(), shell_pid).is_empty()
 }
 
 #[cfg(unix)]
@@ -2936,6 +3034,7 @@ struct SniffSignals {
 struct OscSniffer {
     tok: OscTokenizer,
     shell: ShellState,
+    reports_command_start: bool,
 }
 
 impl OscSniffer {
@@ -2943,18 +3042,43 @@ impl OscSniffer {
         Self {
             tok: OscTokenizer::new(&[b"0", b"2", b"7", b"133", b"9", b"777"]),
             shell: ShellState::default(),
+            reports_command_start: false,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) -> SniffSignals {
         let mut signals = SniffSignals::default();
         let shell = &mut self.shell;
+        let reports_command_start = &mut self.reports_command_start;
         self.tok.feed(bytes, |payload| {
             if let Some(path) = parse_osc7(payload) {
                 signals.cwd = Some(path);
+            } else if let Some((path, tty7_cmd_prompt)) = parse_osc9_cwd_report(payload) {
+                signals.cwd = Some(path);
+                if tty7_cmd_prompt {
+                    // Clink consumes OSC 133 embedded in its prompt renderer,
+                    // so tty7's cmd hook marks its OSC 9;9 report explicitly.
+                    // A generic OSC 9;9 only updates cwd: applications such as
+                    // file managers emit it while using alt-screen and mouse
+                    // modes, and must never be mistaken for a shell prompt.
+                    shell.active = true;
+                    shell.at_prompt = true;
+                    // A prompt means whatever the C mark named has finished.
+                    // cmd reports no D to say so, so this report is what ends
+                    // the cycle — and what lets the agent a Cmder pane was
+                    // running stop being the pane's agent when it exits.
+                    shell.command = None;
+                    match signals.shell.last_mut() {
+                        Some(last) if last.at_prompt => *last = shell.clone(),
+                        _ => signals.shell.push(shell.clone()),
+                    }
+                }
             } else if let Some(title) = parse_osc_title(payload) {
                 signals.title = Some(title);
             } else if let Some(rest) = payload.strip_prefix(b"133;") {
+                if rest.first() == Some(&b'C') {
+                    *reports_command_start = true;
+                }
                 if handle_osc133(shell, rest) {
                     match signals.shell.last_mut() {
                         Some(last) if last.at_prompt == shell.at_prompt => {
@@ -2972,6 +3096,18 @@ impl OscSniffer {
             }
         });
         signals
+    }
+
+    /// Whether this pane's shell has ever said "a command is starting".
+    ///
+    /// Every integrated shell but one reports OSC 133 C, and that report is
+    /// what takes the pane out of its prompt for the duration of a command.
+    /// cmd is the exception — it can run no code between Enter and the next
+    /// prompt — so a cmd pane needs the process tree consulted instead. Asking
+    /// the tree costs a full-system snapshot, so it is worth knowing which
+    /// panes actually need it.
+    fn reports_command_start(&self) -> bool {
+        self.reports_command_start
     }
 }
 
@@ -3019,6 +3155,34 @@ fn strip_uri_drive_slash(path: &str) -> &str {
     } else {
         path
     }
+}
+
+/// ConEmu / Windows Terminal cwd report (`OSC 9;9;<windows-path>`).
+///
+/// cmd.exe cannot assemble an OSC 7 `file://` URI from prompt codes, so its
+/// injected `PROMPT` emits this instead, with `$P` expanded to the drive path.
+fn parse_osc9_cwd_report(payload: &[u8]) -> Option<(PathBuf, bool)> {
+    let rest = payload.strip_prefix(b"9;9;")?;
+    let marker = shell_integration::CMD_OSC9_MARKER.as_bytes();
+    let (rest, tty7_cmd_prompt) = match rest.strip_prefix(marker) {
+        Some(path) => (path, true),
+        None => (rest, false),
+    };
+    let path = String::from_utf8_lossy(rest);
+    let path = path.trim();
+    let path = path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    Some((PathBuf::from(path), tty7_cmd_prompt))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_osc9_cwd(payload: &[u8]) -> Option<PathBuf> {
+    parse_osc9_cwd_report(payload).map(|(path, _)| path)
 }
 
 pub(crate) fn parse_osc7(payload: &[u8]) -> Option<PathBuf> {
@@ -3106,7 +3270,14 @@ mod tests {
         // directory has to win over it.
         let inherited = cmd.get_env("PWD").map(std::ffi::OsStr::to_owned);
         let dir = Some(std::path::PathBuf::from("/tmp"));
-        apply_common_command_setup(&mut cmd, &dir, 1, None, "sh");
+        apply_common_command_setup(
+            &mut cmd,
+            &dir,
+            1,
+            None,
+            "sh",
+            &std::collections::HashMap::new(),
+        );
         assert_ne!(cmd.get_env("PWD").map(std::ffi::OsStr::to_owned), inherited);
         assert_eq!(
             cmd.get_env("PWD"),
@@ -3238,6 +3409,323 @@ mod tests {
             Some(target),
             "a pane whose shell emits no OSC 7 must still report where it \
              actually is — this is what a new tab inherits (issue #187)"
+        );
+    }
+
+    /// The shell-integration unit test starts cmd.exe from an `Injection`
+    /// directly.  This one keeps the production pane construction in the
+    /// loop: shell selection, refreshed Windows environment, ConPTY, OSC
+    /// sniffing, and finally the Prompt message that lets the UI own the line.
+    #[cfg(windows)]
+    #[test]
+    fn live_cmd_pane_arms_the_prompt_editor() {
+        let cmd =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        assert!(Path::new(&cmd).is_file(), "cmd.exe not found at {cmd}");
+
+        let (tx, rx) = mpsc::channel();
+        let pane = DaemonPane::spawn(
+            1,
+            Some(std::env::current_dir().expect("cwd")),
+            ws(80, 24),
+            Some(ShellSpec {
+                program: cmd,
+                args: Vec::new(),
+                args_are_tty7_defaults: true,
+            }),
+            None,
+            None,
+            None,
+            || {},
+        )
+        .expect("spawn cmd pane");
+        pane.attach(tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut prompt = None;
+        while std::time::Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            if let DaemonMsg::Prompt {
+                active,
+                at_prompt,
+                last_exit,
+            } = msg
+            {
+                prompt = Some((active, at_prompt, last_exit));
+                if active && at_prompt {
+                    break;
+                }
+            }
+        }
+        pane.kill();
+
+        assert!(
+            matches!(prompt, Some((true, true, _))),
+            "a selected cmd.exe pane never reported an editable prompt; last report: {prompt:?}"
+        );
+    }
+
+    /// A configured `cmd.exe /K init.bat` remains the user's opaque launch
+    /// contract. The init script must run unchanged, and tty7 must not arm its
+    /// prompt editor without shell-integration reports.
+    #[cfg(windows)]
+    #[test]
+    fn live_cmd_pane_with_custom_k_init_is_not_instrumented() {
+        let cmd =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        assert!(Path::new(&cmd).is_file(), "cmd.exe not found at {cmd}");
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let init = fixture.path().join("init.bat");
+        std::fs::write(&init, b"@echo off\r\nprompt CUSTOM$G\r\n").expect("write cmd init fixture");
+
+        let (tx, rx) = mpsc::channel();
+        let pane = DaemonPane::spawn(
+            2,
+            Some(std::env::current_dir().expect("cwd")),
+            ws(80, 24),
+            Some(ShellSpec {
+                program: cmd,
+                // Isolate the fixture from this machine's HKCU AutoRun. The
+                // custom `/K init.bat` route itself remains the one under test.
+                args: vec![
+                    "/D".into(),
+                    "/k".into(),
+                    init.to_string_lossy().into_owned(),
+                ],
+                args_are_tty7_defaults: false,
+            }),
+            None,
+            None,
+            None,
+            || {},
+        )
+        .expect("spawn configured cmd pane");
+        pane.attach(tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut prompt = None;
+        let mut transcript = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            match msg {
+                DaemonMsg::Snapshot(bytes) | DaemonMsg::Output(bytes) => {
+                    let scan_from = transcript.len().saturating_sub(2);
+                    transcript.extend(bytes);
+                    // The real terminal parser answers cmd/Clink's primary
+                    // device-attributes query. This daemon-only harness must
+                    // play that one client-side role or startup waits forever.
+                    // Answer every newly completed query: Clink versions may
+                    // legitimately ask again after loading their Lua scripts.
+                    let replies = transcript[scan_from..]
+                        .windows(3)
+                        .filter(|window| *window == b"\x1b[c")
+                        .count();
+                    for _ in 0..replies {
+                        pane.write_input(b"\x1b[?62;c");
+                    }
+                    if transcript
+                        .windows(b"CUSTOM>".len())
+                        .any(|w| w == b"CUSTOM>")
+                    {
+                        break;
+                    }
+                }
+                DaemonMsg::Prompt {
+                    active,
+                    at_prompt,
+                    last_exit,
+                } => {
+                    prompt = Some((active, at_prompt, last_exit));
+                    if active && at_prompt {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        pane.kill();
+
+        assert!(
+            transcript
+                .windows(b"CUSTOM>".len())
+                .any(|w| w == b"CUSTOM>"),
+            "cmd.exe /K init.bat did not preserve the user's prompt; transcript: {:?}",
+            String::from_utf8_lossy(&transcript)
+        );
+        assert!(
+            prompt.is_none(),
+            "custom cmd argv unexpectedly enabled shell integration: {prompt:?}"
+        );
+    }
+
+    /// Cmder's init script loads Clink, which consumes the env-only
+    /// `CLINK_PATH` injection and reports an editable prompt without tty7
+    /// changing the configured `/K` command line.
+    #[cfg(windows)]
+    #[test]
+    fn live_cmder_custom_k_arms_the_prompt_editor() {
+        let Some(init) = std::env::var_os("TTY7_TEST_CMD_INIT").map(PathBuf::from) else {
+            eprintln!("skipping: set TTY7_TEST_CMD_INIT to a Cmder-style init.bat");
+            return;
+        };
+        assert!(init.is_file(), "TTY7_TEST_CMD_INIT is not a file: {init:?}");
+        let cmd =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+
+        let (tx, rx) = mpsc::channel();
+        let pane = DaemonPane::spawn(
+            3,
+            Some(std::env::current_dir().expect("cwd")),
+            ws(80, 24),
+            Some(ShellSpec {
+                program: cmd,
+                args: vec![
+                    "/D".into(),
+                    "/K".into(),
+                    init.to_string_lossy().into_owned(),
+                ],
+                args_are_tty7_defaults: false,
+            }),
+            None,
+            None,
+            None,
+            || {},
+        )
+        .expect("spawn Cmder pane");
+        pane.attach(tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut prompt = None;
+        let mut transcript = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            match msg {
+                DaemonMsg::Snapshot(bytes) | DaemonMsg::Output(bytes) => {
+                    let scan_from = transcript.len().saturating_sub(2);
+                    transcript.extend(bytes);
+                    let replies = transcript[scan_from..]
+                        .windows(3)
+                        .filter(|window| *window == b"\x1b[c")
+                        .count();
+                    for _ in 0..replies {
+                        pane.write_input(b"\x1b[?62;c");
+                    }
+                }
+                DaemonMsg::Prompt {
+                    active,
+                    at_prompt,
+                    last_exit,
+                } => {
+                    prompt = Some((active, at_prompt, last_exit));
+                    if active && at_prompt {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        pane.kill();
+
+        assert!(
+            matches!(prompt, Some((true, true, _))),
+            "Cmder's custom /K init never armed tty7's prompt editor; \
+             last report: {prompt:?}; transcript: {:?}",
+            String::from_utf8_lossy(&transcript)
+        );
+    }
+
+    /// Bare cmd — no Clink, so no command-start report exists at all. The
+    /// process-tree probe is the only thing that can take the pane out of its
+    /// prompt, and it has to do so on its own cadence: pressing Enter in cmd
+    /// puts nothing on the wire for the daemon to react to.
+    #[cfg(windows)]
+    #[test]
+    fn live_bare_cmd_pane_leaves_the_prompt_while_a_command_runs() {
+        let cmd =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+
+        let (tx, rx) = mpsc::channel();
+        let pane = DaemonPane::spawn(
+            4,
+            Some(std::env::current_dir().expect("cwd")),
+            ws(80, 24),
+            Some(ShellSpec {
+                program: cmd,
+                // /D keeps this machine's AutoRun — which may inject Clink —
+                // out of a test that is about cmd with tty7's own hooks only.
+                // Treat this fixture flag as a tty7 default so it does not
+                // exercise the custom-argv opt-out covered above.
+                args: vec!["/D".into()],
+                args_are_tty7_defaults: true,
+            }),
+            None,
+            None,
+            None,
+            || {},
+        )
+        .expect("spawn bare cmd pane");
+        pane.attach(tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let mut transcript = Vec::new();
+        let mut armed = false;
+        let mut submitted = false;
+        let mut left_the_prompt = false;
+        let mut rearmed = false;
+        while std::time::Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            match msg {
+                DaemonMsg::Snapshot(bytes) | DaemonMsg::Output(bytes) => {
+                    let scan_from = transcript.len().saturating_sub(2);
+                    transcript.extend(bytes);
+                    let replies = transcript[scan_from..]
+                        .windows(3)
+                        .filter(|window| *window == b"\x1b[c")
+                        .count();
+                    for _ in 0..replies {
+                        pane.write_input(b"\x1b[?62;c");
+                    }
+                }
+                DaemonMsg::Prompt { at_prompt, .. } => {
+                    if at_prompt && !submitted {
+                        armed = true;
+                        // Output while it runs: the reader loop is what drives
+                        // the probe, so a wholly silent command would leave
+                        // nothing to poll on — and nothing to draw over either.
+                        pane.write_input(b"ping -n 6 127.0.0.1\r");
+                        submitted = true;
+                    } else if !at_prompt && submitted {
+                        left_the_prompt = true;
+                    } else if at_prompt && left_the_prompt {
+                        rearmed = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        pane.kill();
+
+        assert!(armed, "the bare cmd pane never reported its first prompt");
+        assert!(
+            left_the_prompt,
+            "bare cmd stayed 'at a prompt' while a command ran; \
+             transcript: {:?}",
+            String::from_utf8_lossy(&transcript)
+        );
+        assert!(
+            rearmed,
+            "the editor never came back after the command finished; \
+             transcript: {:?}",
+            String::from_utf8_lossy(&transcript)
         );
     }
 
@@ -3386,6 +3874,7 @@ mod tests {
         let mut cmd = CommandBuilder::new_default_prog();
         let injection = shell_integration::Injection {
             env: std::collections::HashMap::new(),
+            env_lists: Vec::new(),
             args: vec!["-C".to_string(), "echo ready".to_string()],
             replaces_argv: false,
             dir: None,
@@ -3409,6 +3898,7 @@ mod tests {
         env.insert("ZDOTDIR".to_string(), "/tmp/tty7-zdotdir-test".to_string());
         let injection = shell_integration::Injection {
             env,
+            env_lists: Vec::new(),
             args: Vec::new(),
             replaces_argv: false,
             dir: None,
@@ -3423,6 +3913,60 @@ mod tests {
         assert_eq!(
             cmd.get_env("ZDOTDIR").and_then(|value| value.to_str()),
             Some("/tmp/tty7-zdotdir-test")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integration_env_respects_config_and_merges_declared_lists() {
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.env("ZDOTDIR", "FROM_CONFIG");
+        cmd.env("CLINK_PATH", r" C:\tty7\ ; C:\Users\me\clink");
+        cmd.env("WSLENV", "USER_FLAG/u");
+        let injection = shell_integration::Injection {
+            env: std::collections::HashMap::from([
+                ("ZDOTDIR".to_string(), "FROM_INTEGRATION".to_string()),
+                ("TTY7_SHELL_INTEGRATION".to_string(), String::new()),
+            ]),
+            env_lists: vec![
+                shell_integration::EnvListInjection {
+                    key: "CLINK_PATH".to_string(),
+                    entries: vec![r"C:\tty7".to_string()],
+                    kind: shell_integration::EnvListKind::WindowsPath,
+                },
+                shell_integration::EnvListInjection {
+                    key: "WSLENV".to_string(),
+                    entries: vec!["TTY7_RC/p".to_string(), "TTY7_ZDOTDIR/p".to_string()],
+                    kind: shell_integration::EnvListKind::Wslenv,
+                },
+            ],
+            args: Vec::new(),
+            replaces_argv: false,
+            dir: None,
+        };
+        let configured =
+            std::collections::HashMap::from([("zdotdir".to_string(), "FROM_CONFIG".to_string())]);
+
+        pin_integration_env(&mut cmd, &injection, &configured);
+        assert_eq!(
+            cmd.get_env("ZDOTDIR").and_then(|value| value.to_str()),
+            Some("FROM_CONFIG"),
+            "configured env outranks integration even when the key is recased"
+        );
+        assert_eq!(
+            cmd.get_env("TTY7_SHELL_INTEGRATION")
+                .and_then(|value| value.to_str()),
+            Some("")
+        );
+        assert_eq!(
+            cmd.get_env("CLINK_PATH").and_then(|value| value.to_str()),
+            Some(r" C:\tty7\ ; C:\Users\me\clink"),
+            "trimmed and trailing-slash-equivalent entries are not duplicated"
+        );
+        assert_eq!(
+            cmd.get_env("WSLENV").and_then(|value| value.to_str()),
+            Some("USER_FLAG/u:TTY7_RC/p:TTY7_ZDOTDIR/p"),
+            "WSL integration entries preserve the pane's final WSLENV"
         );
     }
 
@@ -4194,6 +4738,151 @@ mod tests {
     }
 
     #[test]
+    fn parse_osc9_cwd_takes_the_windows_path_literally() {
+        assert_eq!(
+            parse_osc9_cwd(br"9;9;C:\Users\me\dev"),
+            Some(PathBuf::from(r"C:\Users\me\dev"))
+        );
+        assert_eq!(
+            parse_osc9_cwd(br"9;9;\\server\share"),
+            Some(PathBuf::from(r"\\server\share"))
+        );
+        assert_eq!(
+            parse_osc9_cwd(br#"9;9;"C:\Program Files\repo""#),
+            Some(PathBuf::from(r"C:\Program Files\repo")),
+            "ConEmu and Windows' examples quote the reported path"
+        );
+        assert!(parse_osc9_cwd(b"9;9;").is_none());
+        assert!(parse_osc9_cwd(b"9;4;not-cwd").is_none());
+        assert!(parse_osc9_cwd(b"7;file://host/x").is_none());
+    }
+
+    #[test]
+    fn sniff_osc9_cwd_from_cmd_prompt() {
+        let mut s = OscSniffer::new();
+        let st = s.feed(b"\x1b]133;A\x1b\\\x1b]9;9;tty7-cmd;C:\\work\x1b\\\x1b]133;B\x1b\\");
+        assert_eq!(st.cwd, Some(PathBuf::from(r"C:\work")));
+        assert!(st.shell.last().unwrap().at_prompt);
+        assert!(st.shell.last().unwrap().active);
+    }
+
+    #[test]
+    fn generic_osc9_cwd_does_not_arm_a_prompt_or_reset_a_tui() {
+        let mut s = OscSniffer::new();
+        let st = s.feed(b"\x1b]9;9;C:\\work\x1b\\");
+        assert_eq!(st.cwd, Some(PathBuf::from(r"C:\work")));
+        assert!(
+            st.shell.is_empty(),
+            "a generic cwd report from a foreground TUI must not emit Prompt"
+        );
+    }
+
+    #[test]
+    fn marked_osc9_cwd_alone_arms_a_clink_prompt() {
+        let mut s = OscSniffer::new();
+        let st = s.feed(b"\x1b]9;9;tty7-cmd;C:\\work\x1b\\");
+        assert_eq!(st.cwd, Some(PathBuf::from(r"C:\work")));
+        assert_eq!(st.shell.len(), 1);
+        assert!(st.shell[0].active);
+        assert!(st.shell[0].at_prompt);
+    }
+
+    /// A bare cmd pane reports no C at all, so the Windows fallback is what
+    /// keeps its editor off a running program's input line. Driven against a
+    /// real cmd rather than this test process, whose own children come and go
+    /// as the rest of the suite runs.
+    #[cfg(windows)]
+    #[test]
+    fn windows_falls_back_to_the_process_tree_when_the_shell_reports_no_c() {
+        use std::io::Write;
+
+        let comspec =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        let mut shell = std::process::Command::new(&comspec)
+            .args(["/D", "/K"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a cmd to stand in for the pane's shell");
+        let pid = shell.id();
+        let master = Mutex::new(None);
+
+        assert!(
+            !foreground_command_running(&master, Some(pid), false),
+            "a cmd sitting at its prompt is not running a command"
+        );
+
+        let mut stdin = shell.stdin.take().expect("piped stdin");
+        // A command with a child of its own that outlives the assertion.
+        writeln!(stdin, "ping -n 30 127.0.0.1 > nul").expect("submit");
+        stdin.flush().expect("flush");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !foreground_command_running(&master, Some(pid), false)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            foreground_command_running(&master, Some(pid), false),
+            "a cmd running a command must read as busy, or tty7's editor \
+             draws over whatever took the line"
+        );
+        // A shell that reports C is trusted instead: the same live child must
+        // not read as a running command, because a prompt's own helpers
+        // (Cmder shells out to `git`) would otherwise disarm the editor.
+        assert!(!foreground_command_running(&master, Some(pid), true));
+
+        for descendant in
+            crate::daemon::winproc::descendants(&crate::daemon::winproc::snapshot(), pid)
+        {
+            crate::daemon::winproc::terminate(descendant);
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+    }
+
+    /// prompt" for the whole run, because cmd reports no C and the batch hook
+    /// says so out loud. Clink can report one, and the prompt's own OSC 9;9 is
+    /// what ends the cycle — cmd has no D either.
+    #[test]
+    fn clink_command_start_leaves_the_prompt_until_the_next_report() {
+        let mut s = OscSniffer::new();
+        assert!(!s.reports_command_start());
+
+        s.feed(b"\x1b]9;9;tty7-cmd;C:\\work\x1b\\");
+        assert!(s.shell.at_prompt, "the prompt arms the editor");
+
+        let submitted = s.feed(b"\x1b]133;C;codex --yolo\x1b\\");
+        assert!(
+            !submitted.shell.last().unwrap().at_prompt,
+            "a full-screen agent must own its own input line"
+        );
+        assert_eq!(
+            submitted.shell.last().unwrap().command.as_deref(),
+            Some("codex --yolo")
+        );
+        assert!(
+            s.reports_command_start(),
+            "a shell that reports C needs no process-tree fallback"
+        );
+
+        // Whatever the agent writes while it runs must not re-arm the editor.
+        let running = s.feed(b"\x1b]9;9;C:\\work\x1b\\some output\r\n");
+        assert!(running.shell.is_empty());
+        assert!(!s.shell.at_prompt);
+
+        let back = s.feed(b"\x1b]9;9;tty7-cmd;C:\\work\x1b\\");
+        assert!(back.shell.last().unwrap().at_prompt);
+        assert_eq!(
+            back.shell.last().unwrap().command,
+            None,
+            "the prompt ends the cycle, so the pane stops running that agent"
+        );
+    }
+
+    #[test]
     fn strip_uri_drive_slash_only_unwraps_drive_paths() {
         assert_eq!(strip_uri_drive_slash("/C:/Users/foo"), "C:/Users/foo");
         assert_eq!(strip_uri_drive_slash("/d:/x"), "d:/x");
@@ -4361,7 +5050,7 @@ mod tests {
                 Arc::new(OutputGate::new()),
                 Box::new(std::io::Cursor::new(b"\x1b]133;D;0\x07".to_vec())),
                 null_writer(),
-                || false,
+                |_| false,
                 ForegroundProbes {
                     remote: Box::new(|| None),
                     agent: Box::new(|| Some(None)),
@@ -4422,7 +5111,7 @@ mod tests {
                 Arc::new(OutputGate::new()),
                 Box::new(std::io::Cursor::new(output.to_vec())),
                 null_writer(),
-                || false,
+                |_| false,
                 ForegroundProbes {
                     remote: Box::new(|| None),
                     agent: Box::new(|| Some(None)),
@@ -5096,7 +5785,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(b"tail".to_vec())),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5200,7 +5889,7 @@ mod tests {
                 delayed: false,
             }),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5297,7 +5986,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(NeverEofReader),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5334,7 +6023,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::empty()),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5404,7 +6093,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(stream.into_bytes())),
             writer,
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5450,7 +6139,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(b"x\x1b_Ga=d,d=A\x1b\\y".to_vec())),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5501,7 +6190,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(b"alice@host ~ % ".to_vec())),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5532,7 +6221,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(Vec::new())),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
@@ -5558,7 +6247,7 @@ mod tests {
             Arc::new(OutputGate::new()),
             Box::new(std::io::Cursor::new(Vec::new())),
             null_writer(),
-            || false,
+            |_| false,
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),

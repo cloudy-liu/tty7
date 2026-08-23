@@ -110,12 +110,15 @@ Keybindings**.
 
 The prompt features arrive through tty7's shell integration, which is injected
 automatically — nothing to add to your rc file — for **zsh**, **bash**,
-**fish**, **PowerShell**, and **WSL**. Other shells (nushell, elvish, xonsh, and
-the rest) run perfectly well in a pane; they simply do not get the prompt layer.
+**fish**, **PowerShell**, **CMD / Clink** (including Cmder), and **WSL**. A
+custom CMD startup must load Clink for tty7 to integrate it without changing
+the configured arguments. Other shells (nushell, elvish, xonsh, and the rest)
+run perfectly well in a pane; they simply do not get the prompt layer.
 
 The integration is also what reports the working directory, the exit code of
 each command, and where prompts begin — which is what the sidebar's branch
 readout, the "command finished" notification, and `tty7 procs` are built on.
+CMD reports prompt boundaries and cwd, but not reliable exit codes.
 
 [How shell integration works →](/reference/shell-integration)
 
