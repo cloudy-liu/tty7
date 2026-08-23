@@ -14,7 +14,7 @@ use tty7_core::daemon::install::AssetFetcher as _;
 use crate::core::config::{Config, UpdateChannel};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 
-const REPO: &str = "l0ng-ai/tty7";
+const REPO: &str = "cloudy-liu/tty7";
 
 /// The rolling prerelease the Nightly channel follows. Force-moved to a new
 /// commit every night, which is exactly why it cannot double as a version.
@@ -24,13 +24,13 @@ const NIGHTLY_TAG: &str = "nightly";
 /// inferred. See `resolve_version`.
 const NIGHTLY_MANIFEST: &str = "nightly.json";
 
-pub const RELEASES_URL: &str = "https://github.com/l0ng-ai/tty7/releases/latest";
+pub const RELEASES_URL: &str = "https://github.com/cloudy-liu/tty7/releases/latest";
 
 /// The nightly release's own page. Unlike Stable's, this URL is stable across
 /// nights — the tag stays put even as the commit under it moves. Spelled out
 /// rather than built from `NIGHTLY_TAG`, which `concat!` cannot take; the tail
 /// is asserted against it in `each_channel_reads_its_own_feed` instead.
-pub const NIGHTLY_RELEASE_URL: &str = "https://github.com/l0ng-ai/tty7/releases/tag/nightly";
+pub const NIGHTLY_RELEASE_URL: &str = "https://github.com/cloudy-liu/tty7/releases/tag/nightly";
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -3114,6 +3114,14 @@ mod tests {
         assert!(!is_update_available("v26.7.1-rc.1", "26.7.1"));
     }
 
+    #[test]
+    fn custom_release_series_advances_without_falling_back_to_upstream() {
+        assert!(!is_update_available("v26.8.3-c", "26.8.3-c"));
+        assert!(is_update_available("v26.8.3-c.1", "26.8.3-c"));
+        assert!(is_update_available("v26.8.4-c", "26.8.3-c.9"));
+        assert!(!is_update_available("v26.8.3-c", "26.8.3-c.1"));
+    }
+
     /// The Nightly channel's whole reason to exist: last night's build has to
     /// be able to supersede the one before it. This is what the old ordering
     /// deliberately refused to do, back when the only feed was
@@ -3159,6 +3167,9 @@ mod tests {
     /// feeds cannot see each other's builds.
     #[test]
     fn each_channel_reads_its_own_feed() {
+        assert_eq!(REPO, "cloudy-liu/tty7");
+        assert!(RELEASES_URL.starts_with("https://github.com/cloudy-liu/tty7/"));
+        assert!(NIGHTLY_RELEASE_URL.starts_with("https://github.com/cloudy-liu/tty7/"));
         assert!(release_endpoint(UpdateChannel::Stable).ends_with("/releases/latest"));
         assert!(
             release_endpoint(UpdateChannel::Nightly)

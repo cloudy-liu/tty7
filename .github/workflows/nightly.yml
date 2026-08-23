@@ -1,9 +1,9 @@
 name: Nightly
 
-# Unattended nightly channel: build `main` every night, stamp a pre-release
-# CalVer version (<next-stable>-nightly.<YYYYMMDDHHMM>), and publish everything
-# to a single rolling `nightly` prerelease. Stable releases (release.yml) are
-# untouched.
+# Manually triggered nightly channel: stamp a pre-release CalVer version
+# (<next-stable>-nightly.<YYYYMMDDHHMM>) and publish everything to a single
+# rolling `nightly` prerelease. The custom stable releases in release.yml are
+# the maintained default channel and are untouched.
 #
 # This is a real update channel, not just a build: an installation set to
 # Nightly reads /releases/tags/nightly and rolls from one of these to the next.
@@ -11,8 +11,8 @@ name: Nightly
 # them. See `core::update::release_endpoint`.
 
 on:
-  schedule:
-    - cron: "0 18 * * *" # 18:00 UTC = 02:00 Beijing
+  # Custom stable builds are the maintained channel in this fork. Keep Nightly
+  # available for an explicit maintainer run, but do not publish it on a timer.
   workflow_dispatch:
 
 permissions:
@@ -54,8 +54,10 @@ jobs:
           # offers to the people who took the morning build. Still one numeric
           # identifier, which is what `parse_version` orders nightlies by — it
           # compares them all, so this stays sound if a segment is ever added.
-          LAST=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          LAST=$(git tag -l 'v*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-c(\.[0-9]+)?)?$' | head -1)
           BASE=${LAST#v}
+          BASE=${BASE%%-c*}
           NEXT="${BASE%.*}.$(( ${BASE##*.} + 1 ))"
           VERSION="${NEXT}-nightly.$(date -u +%Y%m%d%H%M)"
           echo "building $VERSION from ${GITHUB_SHA::7}"

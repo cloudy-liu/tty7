@@ -265,7 +265,7 @@ pub(crate) const TILE_PAD_SM: f32 = (TILE_SIZE_SM - TILE_GLYPH_SM) / 2.;
 
 const DOCS_URL: &str = "https://github.com/l0ng-ai/tty7#readme";
 const DISCORD_URL: &str = "https://discord.gg/s3dethqz2V";
-const ISSUES_URL: &str = "https://github.com/l0ng-ai/tty7/issues/new";
+const ISSUES_URL: &str = "https://github.com/cloudy-liu/tty7/issues/new";
 
 pub(crate) const CONTENT_INSET: f32 = 12.;
 

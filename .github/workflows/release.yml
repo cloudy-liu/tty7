@@ -2,13 +2,37 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
+    tags: ["v*-c*"]
 
 permissions:
   contents: write
 
 jobs:
+  validate-release:
+    name: validate custom release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tty7
+
+      - name: Match tag, package version, and custom suffix
+        working-directory: tty7
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          EXPECTED_TAG="v${VERSION}"
+          if [[ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VERSION} (expected ${EXPECTED_TAG})"
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-c(\.[0-9]+)?$ ]]; then
+            echo "::error::custom releases must use X.Y.Z-c or X.Y.Z-c.N (got ${VERSION})"
+            exit 1
+          fi
+          echo "validated custom release ${EXPECTED_TAG}"
+
   build:
     # The Windows installer embeds the Linux musl `tty7-server` so a WSL distro
     # can be served the binary the client already shipped with, instead of
@@ -17,7 +41,7 @@ jobs:
     # parallel. Serialising all four platforms behind it costs a few minutes on
     # a release — cheap next to splitting the Windows entry into its own job and
     # duplicating the whole toolchain/caching preamble.
-    needs: server-musl
+    needs: [validate-release, server-musl]
     strategy:
       fail-fast: false
       matrix:
@@ -194,6 +218,7 @@ jobs:
   # Separate from the `build` matrix above because it shares nothing with it: no
   # GUI toolchain, no bundling, no code signing, two targets off one runner.
   server-musl:
+    needs: validate-release
     strategy:
       fail-fast: false
       # `target` is the build triple; `asset` is the published filename. They
@@ -297,6 +322,7 @@ jobs:
   # Gatekeeper is not in the path at all. The ad-hoc signature the linker applies
   # is all arm64 asks for, and `assert-macho.sh` checks it is there.
   server-macos:
+    needs: validate-release
     strategy:
       fail-fast: false
       matrix:
@@ -382,8 +408,8 @@ jobs:
   # created as a **draft** and left that way: a draft is invisible to both
   # /releases/latest and the releases page, so nothing can prompt a user to
   # download a version whose asset set is incomplete or whose notes are still
-  # empty. Publishing is the release skill's job — it verifies the platform assets and
-  # writes the body first, then flips the draft. See .claude/skills/release/SKILL.md.
+  # empty. A maintainer verifies the assets and checksums, writes the release
+  # notes, and publishes the draft only after the complete custom build exists.
   draft-release:
     needs: [build, server-musl, server-macos]
     if: startsWith(github.ref, 'refs/tags/')
