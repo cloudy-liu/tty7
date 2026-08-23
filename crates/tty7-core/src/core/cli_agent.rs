@@ -832,20 +832,42 @@ mod tests {
 
     #[test]
     fn an_interpreter_image_path_only_matches_a_distinctive_install_prefix() {
-        use std::path::Path;
+        use std::path::PathBuf;
+
+        // Build paths from components so this Windows-focused detection test
+        // still exercises the same component boundaries on Unix CI runners.
+        let native_path = |components: &[&str]| components.iter().collect::<PathBuf>();
 
         assert_eq!(
             CLIAgent::detect_from_image_path_with(
-                Path::new(r"C:\Users\me\AppData\Local\cursor-agent\versions\current\node.exe"),
+                &native_path(&[
+                    "Users",
+                    "me",
+                    "AppData",
+                    "Local",
+                    "cursor-agent",
+                    "versions",
+                    "current",
+                    "node.exe",
+                ]),
                 &HashMap::new(),
             ),
             Some(CLIAgent::Cursor)
         );
         assert_eq!(
             CLIAgent::detect_from_image_path_with(
-                Path::new(
-                    r"C:\Users\me\AppData\Roaming\npm\node_modules\@openai\codex\vendor\node.exe"
-                ),
+                &native_path(&[
+                    "Users",
+                    "me",
+                    "AppData",
+                    "Roaming",
+                    "npm",
+                    "node_modules",
+                    "@openai",
+                    "codex",
+                    "vendor",
+                    "node.exe",
+                ]),
                 &HashMap::new(),
             ),
             Some(CLIAgent::Codex),
@@ -853,7 +875,7 @@ mod tests {
         );
         assert_eq!(
             CLIAgent::detect_from_image_path_with(
-                Path::new(r"C:\Users\claude\AppData\Local\fnm\node.exe"),
+                &native_path(&["Users", "claude", "AppData", "Local", "fnm", "node.exe"]),
                 &HashMap::new(),
             ),
             None,
@@ -861,14 +883,16 @@ mod tests {
         );
         assert_eq!(
             CLIAgent::detect_from_image_path_with(
-                Path::new(r"C:\Users\me\pi\node.exe"),
+                &native_path(&["Users", "me", "pi", "node.exe"]),
                 &HashMap::new(),
             ),
             None
         );
         assert_eq!(
             CLIAgent::detect_from_image_path_with(
-                Path::new(r"/Users/amp/.nvm/versions/node/v22.0.0/bin/node"),
+                &native_path(&[
+                    "Users", "amp", ".nvm", "versions", "node", "v22.0.0", "bin", "node",
+                ]),
                 &HashMap::new(),
             ),
             None
