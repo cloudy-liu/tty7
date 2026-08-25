@@ -973,12 +973,20 @@ fn cmd_prompt_wrapper() -> String {
 /// Clink renders its own `clink.prompt.value` after cmd expands `%PROMPT%`, so
 /// even a trailing `prompt ...` cannot wrap a Cmder prompt. Clink deliberately
 /// loads every directory in `CLINK_PATH`; a late prompt filter lets the user's
-/// filters finish first, then adds the OSC 9;9 cwd/prompt report that Clink's
-/// renderer preserves (it consumes OSC 133 embedded in a prompt string).
+/// filters finish first, then reports cwd with OSC 9;9.
+///
+/// The report is written with `io.write`, not concatenated into the prompt
+/// string. Some Clink versions (1.2.x among them) copy an OSC out of a prompt
+/// into a small buffer and drop ST when the Windows path is long; the visible
+/// prompt is then swallowed as unterminated OSC. Emitting the sequence as raw
+/// bytes keeps it off that path. Clink still consumes OSC 133 embedded in a
+/// prompt string, which is why the batch wrapper cannot rely on 133 A/B once
+/// Clink is in the pane.
 ///
 /// A Clink that kept the whole `%PROMPT%` — rather than replacing it, which is
-/// what Cmder's own filters do — already carries the marker, and a second
-/// report would make one prompt cycle look like two.
+/// what Cmder's own filters do — already carries the batch wrapper's OSC 9;9,
+/// and that copy would hit the same truncation. The filter strips it and
+/// emits a complete report via `io.write` instead.
 #[cfg(windows)]
 const CMD_CLINK_INTEGRATION: &str = r#"
 if clink then
@@ -999,12 +1007,22 @@ if clink then
         end
         return ""
     end
-    local function tty7_wrap_prompt(prompt)
-        prompt = prompt or ""
-        if prompt:find(marker, 1, true) then
-            return prompt
+    -- Drop an OSC 9;9 the batch wrapper left in %PROMPT%, so Clink cannot
+    -- truncate its ST while processing the prompt. Find ST only after the
+    -- payload: a Windows path has backslashes, but not ESC+\.
+    local function tty7_strip_cwd_osc(prompt)
+        local needle = esc .. marker
+        while true do
+            local start = prompt:find(needle, 1, true)
+            if not start then
+                return prompt
+            end
+            local st_at = prompt:find(st, start + #needle, true)
+            if not st_at then
+                return prompt
+            end
+            prompt = prompt:sub(1, start - 1) .. prompt:sub(st_at + #st)
         end
-        return esc .. marker .. tty7_cwd() .. st .. prompt
     end
     -- clink.print is the ANSI-aware path, but NONL (no trailing newline) only
     -- exists from v1.2.11. io.write is the plain-Lua fallback for older ones.
@@ -1014,6 +1032,18 @@ if clink then
         else
             io.write(seq)
         end
+    end
+    local function tty7_wrap_prompt(prompt)
+        prompt = prompt or ""
+        pcall(function()
+            io.write(esc .. marker .. tty7_cwd() .. st)
+            if io.flush then
+                io.flush()
+            end
+        end)
+        -- Strip after the write so a failed emit still leaves the batch
+        -- wrapper's OSC in %PROMPT% rather than dropping both copies.
+        return tty7_strip_cwd_osc(prompt)
     end
     if clink.promptfilter then
         local tty7_prompt = clink.promptfilter(999)
@@ -3127,6 +3157,18 @@ mod tests {
         assert!(lua.contains("os.getcwd"));
         assert!(lua.contains("pcall"));
         assert!(lua.contains("clink.promptfilter(999)"));
+        assert!(
+            lua.contains("io.write(esc .. marker .. tty7_cwd() .. st)"),
+            "the cwd OSC must leave the process as raw bytes, not as prompt text"
+        );
+        assert!(
+            !lua.contains("st .. prompt"),
+            "concatenating OSC into Clink's prompt string truncates ST on a long cwd"
+        );
+        assert!(
+            lua.contains("tty7_strip_cwd_osc"),
+            "an OSC already in %PROMPT% must be stripped so Clink cannot truncate it"
+        );
         assert!(
             lua.contains("clink.onendedit") && lua.contains("]133;C;"),
             "cmd cannot report command start on its own; Clink is the only \
