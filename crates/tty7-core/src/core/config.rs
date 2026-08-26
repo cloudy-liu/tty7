@@ -500,8 +500,8 @@ pub enum MouseZoomModifier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BellMode {
-    None,
     #[default]
+    None,
     Visual,
     Audible,
     Both,
@@ -621,7 +621,7 @@ impl Default for Config {
             notify_threshold_secs: default_notify_threshold_secs(),
             restore_session: true,
             show_tray_icon: true,
-            bell: BellMode::Visual,
+            bell: BellMode::None,
             prompt_editor: true,
             tab_completion: true,
             history_search: true,
@@ -1763,7 +1763,7 @@ mod tests {
         assert!(cfg.tab_completion);
         assert!(cfg.history_search);
         assert_eq!(cfg.notify_threshold_secs, 10);
-        assert_eq!(cfg.bell, BellMode::Visual);
+        assert_eq!(cfg.bell, BellMode::None);
 
         let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
         assert!(cfg.restore_session);
@@ -1772,7 +1772,7 @@ mod tests {
         assert!(cfg.tab_completion);
         assert!(cfg.history_search);
         assert_eq!(cfg.notify_threshold_secs, 10);
-        assert_eq!(cfg.bell, BellMode::Visual);
+        assert_eq!(cfg.bell, BellMode::None);
 
         let cfg: Config = serde_json::from_str(r#"{"tab_completion": false}"#).unwrap();
         assert!(!cfg.tab_completion);
@@ -1793,7 +1793,7 @@ mod tests {
         assert_eq!(cfg.bell, BellMode::Both);
 
         let cfg: Config = serde_json::from_str(r#"{"bell": "loud"}"#).unwrap();
-        assert_eq!(cfg.bell, BellMode::Visual);
+        assert_eq!(cfg.bell, BellMode::None);
 
         assert_eq!(serde_json::to_string(&BellMode::Both).unwrap(), "\"both\"");
     }
