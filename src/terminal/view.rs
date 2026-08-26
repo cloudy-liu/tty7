@@ -9221,6 +9221,51 @@ mod gpui_tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// An `ssh` hop used to keep the local repo's branch and +N −M on the
+    /// sidebar, because Windows never marked the pane remote.
+    #[gpui::test]
+    fn an_ssh_hop_drops_the_local_git_status(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, window, cx| {
+                view.git_status_cwd = Some(std::path::PathBuf::from(r"G:\tools\dev\perfbox"));
+                view.poll_foreground(window, cx);
+                assert!(
+                    view.git_status_cwd.is_some(),
+                    "still a local working tree until ssh is seen"
+                );
+            })
+            .unwrap();
+
+        DaemonMsg::RemoteContext(Some(crate::daemon::protocol::RemoteContext {
+            kind: crate::daemon::protocol::RemoteKind::Ssh,
+            argv: vec!["ssh.exe".into(), "box".into()],
+            target: "box".into(),
+        }))
+        .encode(&mut daemon)
+        .unwrap();
+        for _ in 0..200 {
+            let seen = window
+                .update(cx, |view, _, _| view.remote_context().is_some())
+                .unwrap();
+            if seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, window, cx| {
+                assert!(!view.cwd_is_on_host(), "the far side is not this machine");
+                view.poll_foreground(window, cx);
+                assert!(
+                    view.git_status_cwd.is_none(),
+                    "local +N −M must not ride along with the ssh hop"
+                );
+            })
+            .unwrap();
+    }
+
     /// A path a remote pane printed stays *wanted* until a host has actually
     /// been asked about it.
     ///

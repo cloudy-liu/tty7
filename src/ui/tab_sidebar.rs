@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::path::{Path, PathBuf};
 
 use crate::core::config::{Config, SidebarGrouping};
+use crate::daemon::protocol::RemoteKind;
 use crate::terminal::git_status::GitStatusCache;
 use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
 use crate::ui::hints::tab_badge_label;
@@ -1283,6 +1284,13 @@ impl Tty7App {
                 }
                 let cwd = tab.pane.first_leaf().and_then(|leaf| {
                     let view = leaf.terminal()?.read(cx);
+                    if in_pane_ssh_hop(
+                        view.host_id().is_local(),
+                        view.remote_context().map(|r| r.kind),
+                    ) {
+                        *tab.sidebar_group.borrow_mut() = None;
+                        return None;
+                    }
                     Some((view.host_id(), view.git_status_cwd()?.to_path_buf()))
                 });
                 if let Some((id, cwd)) = cwd {
@@ -1342,6 +1350,13 @@ impl Tty7App {
         let known = cx.try_global::<GitStatusCache>()?.known_repo_for(host, cwd);
         resolved_group(cx.global::<Config>().sidebar_grouping, known, cwd)
     }
+}
+
+/// A hop this pane made with `ssh` (or tty7's own SSH engine) from a local
+/// window. The far side is not a Host we can git-probe, so the tab must not
+/// keep the local repo group it started in.
+fn in_pane_ssh_hop(host_is_local: bool, kind: Option<RemoteKind>) -> bool {
+    host_is_local && matches!(kind, Some(RemoteKind::Ssh | RemoteKind::NativeSsh))
 }
 
 /// The group a probed cwd resolves to under `grouping`: the repo home when
@@ -1616,6 +1631,21 @@ mod tests {
                 Some(Some(p("/w/repo")))
             );
         }
+    }
+
+    #[test]
+    fn an_in_pane_ssh_hop_is_not_the_local_repo() {
+        assert!(in_pane_ssh_hop(true, Some(RemoteKind::Ssh)));
+        assert!(in_pane_ssh_hop(true, Some(RemoteKind::NativeSsh)));
+        assert!(
+            !in_pane_ssh_hop(true, Some(RemoteKind::Wsl)),
+            "WSL still has a path this machine can read"
+        );
+        assert!(!in_pane_ssh_hop(true, None));
+        assert!(
+            !in_pane_ssh_hop(false, Some(RemoteKind::Ssh)),
+            "a remote workspace probes git on that host"
+        );
     }
 
     #[test]
