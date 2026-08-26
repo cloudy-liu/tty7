@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tty7_core::daemon::install::AssetFetcher as _;
+use tty7_core::daemon::install::asset::{CHECKSUMS_ASSET, download_url};
 
 use crate::core::config::{Config, UpdateChannel};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
@@ -21,7 +22,7 @@ const REPO: &str = "cloudy-liu/tty7";
 const NIGHTLY_TAG: &str = "nightly";
 
 /// Published beside the nightly packages so the version is stated rather than
-/// inferred. See `resolve_version`.
+/// inferred from asset names. The Nightly channel reads this file directly.
 const NIGHTLY_MANIFEST: &str = "nightly.json";
 
 pub const RELEASES_URL: &str = "https://github.com/cloudy-liu/tty7/releases/latest";
@@ -1754,13 +1755,12 @@ impl UpdateState {
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug)]
 struct LatestRelease {
-    tag_name: String,
     assets: Vec<GitHubAsset>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug)]
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
@@ -1780,20 +1780,52 @@ struct NightlyManifest {
     published_at: String,
 }
 
-/// The GitHub endpoint each channel reads.
+/// The GitHub URL each channel hits to learn which build is current.
+///
+/// These are github.com pages and files, not api.github.com: the REST catalog
+/// is rate-limited per public IP, and a shared NAT can exhaust that quota
+/// without this installation making many requests of its own.
 ///
 /// Keeping the two feeds apart is the whole point of the channel: neither can
 /// hand the other an update, so an installation only changes channel when the
-/// user changes it in Settings.
+/// user changes it in Settings. `/releases/latest` excludes prereleases, so
+/// Stable can never be offered a nightly even though both live in the same
+/// repository.
 fn release_endpoint(channel: UpdateChannel) -> String {
     match channel {
-        // Excludes prereleases by definition, so Stable can never be offered a
-        // nightly even though both live in the same repository.
-        UpdateChannel::Stable => format!("https://api.github.com/repos/{REPO}/releases/latest"),
-        UpdateChannel::Nightly => {
-            format!("https://api.github.com/repos/{REPO}/releases/tags/{NIGHTLY_TAG}")
-        }
+        UpdateChannel::Stable => format!("https://github.com/{REPO}/releases/latest"),
+        UpdateChannel::Nightly => download_url(NIGHTLY_TAG, NIGHTLY_MANIFEST),
     }
+}
+
+/// GitHub answers `/releases/latest` with a redirect to `/releases/tag/<tag>`.
+/// The Location may be absolute or site-relative, and may carry a query string.
+fn tag_from_release_location(location: &str) -> Option<&str> {
+    const MARKER: &str = "/releases/tag/";
+    let rest = location.split_once(MARKER)?.1;
+    let rest = rest.split(['?', '#']).next()?.trim_end_matches('/');
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// The GUI packages the updater knows how to install, plus checksums. Names
+/// are a closed set matching `package_for_current_install`; download URLs are
+/// built from the tag rather than listed through the REST API.
+fn published_gui_assets(tag: &str, version: &str) -> Vec<GitHubAsset> {
+    [
+        format!("tty7-{version}-linux-x86_64.AppImage"),
+        format!("tty7-{version}-linux-x86_64.tar.gz"),
+        format!("tty7-{version}-macos-arm64.zip"),
+        format!("tty7-{version}-macos-x86_64.zip"),
+        format!("tty7-{version}-windows-x86_64-setup.exe"),
+        format!("tty7-{version}-windows-x86_64.zip"),
+        CHECKSUMS_ASSET.to_string(),
+    ]
+    .into_iter()
+    .map(|name| GitHubAsset {
+        browser_download_url: download_url(tag, &name),
+        name,
+    })
+    .collect()
 }
 
 /// Recovers the version from a package name such as
@@ -1839,23 +1871,27 @@ fn build_http_client(manual_proxy: Option<&str>) -> Result<ReqwestClient> {
     }
 }
 
+fn github_http_error(status: http_client::http::StatusCode, body: &[u8]) -> String {
+    let code = status.as_u16();
+    let text = String::from_utf8_lossy(body);
+    if text.contains("rate limit") {
+        format!("GitHub rate limit (HTTP {code})")
+    } else {
+        format!("GitHub returned HTTP {code}")
+    }
+}
+
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     client: &ReqwestClient,
     url: &str,
 ) -> Result<T> {
     let request = http_client::Request::get(url)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
         .follow_redirects(RedirectPolicy::FollowAll)
         .body(AsyncBody::default())
         .context("building request")?;
 
     let mut response = client.send(request).await.context("sending the request")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub returned HTTP {}", response.status().as_u16());
-    }
-
+    let status = response.status();
     let mut body = Vec::new();
     response
         .body_mut()
@@ -1863,56 +1899,83 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .await
         .context("reading response body")?;
 
+    if !status.is_success() {
+        anyhow::bail!("{}", github_http_error(status, &body));
+    }
+
     serde_json::from_slice(&body).context("parsing JSON")
 }
 
-/// Returns the release together with the version it advertises, which is not
-/// always something the release object states outright — see `resolve_version`.
+/// `/releases/latest` 302s to `/releases/tag/<tag>`. Not following that
+/// redirect is the whole discovery: the tag is the Location, not a REST body.
+async fn fetch_stable_tag(client: &ReqwestClient) -> Result<String> {
+    let request = http_client::Request::get(RELEASES_URL)
+        .follow_redirects(RedirectPolicy::NoFollow)
+        .body(AsyncBody::default())
+        .context("building request")?;
+
+    let mut response = client.send(request).await.context("sending the request")?;
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(http_client::http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let mut body = Vec::new();
+    let _ = response.body_mut().read_to_end(&mut body).await;
+
+    if status.is_redirection() {
+        let location = location
+            .ok_or_else(|| anyhow::anyhow!("latest release redirect had no Location header"))?;
+        return tag_from_release_location(&location)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("could not parse release tag from {location}"));
+    }
+
+    anyhow::bail!("{}", github_http_error(status, &body));
+}
+
+/// Returns the release together with the version it advertises.
+///
+/// Stable states the version in the tag (`v26.8.1`). Nightly cannot: its tag
+/// is force-moved to a new commit every night and so is the literal string
+/// `nightly`. It publishes `nightly.json` beside the packages instead.
 async fn fetch_latest_release(
     channel: UpdateChannel,
     manual_proxy: Option<String>,
 ) -> Result<(LatestRelease, String)> {
     let client = build_http_client(manual_proxy.as_deref())?;
-    let release: LatestRelease = fetch_json(&client, &release_endpoint(channel))
-        .await
-        .context("requesting the release")?;
-    let version = resolve_version(&client, &release)
-        .await
-        .with_context(|| format!("release {} advertises no usable version", release.tag_name))?;
-    Ok((release, version))
-}
-
-/// The version a release stands for.
-///
-/// Stable states it in the tag (`v26.8.1`) and needs nothing else. Nightly
-/// cannot: its tag is force-moved to a new commit every night and so is the
-/// literal string `nightly`, which carries no version at all. It publishes
-/// `nightly.json` beside the packages instead.
-///
-/// The fall back to asset names covers the two cases where the manifest is
-/// absent — a nightly published before it existed, and a night where writing it
-/// failed — because neither is a reason to strand the whole channel.
-async fn resolve_version(client: &ReqwestClient, release: &LatestRelease) -> Option<String> {
-    if parse_version(&release.tag_name).is_some() {
-        return Some(release.tag_name.trim_start_matches('v').to_string());
-    }
-    if let Some(asset) = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == NIGHTLY_MANIFEST)
-    {
-        match fetch_json::<NightlyManifest>(client, &asset.browser_download_url).await {
-            Ok(manifest) if parse_version(&manifest.version).is_some() => {
-                return Some(manifest.version);
-            }
-            Ok(manifest) => log::warn!(
-                "{NIGHTLY_MANIFEST} declares an unusable version {:?}; falling back to asset names",
-                manifest.version
-            ),
-            Err(e) => log::warn!("could not read {NIGHTLY_MANIFEST}: {e:#}"),
+    let (tag, version) = match channel {
+        UpdateChannel::Stable => {
+            let tag = fetch_stable_tag(&client)
+                .await
+                .context("requesting the release")?;
+            let version = parse_version(&tag)
+                .map(|_| tag.trim_start_matches('v').to_string())
+                .with_context(|| format!("latest tag {tag:?} is not a usable version"))?;
+            (tag, version)
         }
-    }
-    version_from_assets(&release.assets)
+        UpdateChannel::Nightly => {
+            let tag = NIGHTLY_TAG.to_string();
+            let manifest: NightlyManifest = fetch_json(&client, &release_endpoint(channel))
+                .await
+                .context("requesting the release")?;
+            if parse_version(&manifest.version).is_none() {
+                anyhow::bail!(
+                    "release {tag} advertises no usable version ({:?})",
+                    manifest.version
+                );
+            }
+            (tag, manifest.version)
+        }
+    };
+    Ok((
+        LatestRelease {
+            assets: published_gui_assets(&tag, &version),
+        },
+        version,
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3164,21 +3227,82 @@ mod tests {
     /// Each channel reads its own release, which is the mechanism that keeps a
     /// Nightly from being walked back onto Stable by an update it never asked
     /// for. `/releases/latest` excludes prereleases by definition, so the two
-    /// feeds cannot see each other's builds.
+    /// feeds cannot see each other's builds. Discovery stays on github.com so
+    /// a shared public IP cannot exhaust the REST catalog quota.
     #[test]
     fn each_channel_reads_its_own_feed() {
         assert_eq!(REPO, "cloudy-liu/tty7");
+        assert_eq!(release_endpoint(UpdateChannel::Stable), RELEASES_URL);
+        assert!(
+            !release_endpoint(UpdateChannel::Stable).contains("api.github.com"),
+            "Stable must not use the REST catalog"
+        );
+        assert_eq!(
+            release_endpoint(UpdateChannel::Nightly),
+            "https://github.com/cloudy-liu/tty7/releases/download/nightly/nightly.json"
+        );
+        assert!(
+            !release_endpoint(UpdateChannel::Nightly).contains("api.github.com"),
+            "Nightly must not use the REST catalog"
+        );
+        // The page a Nightly user is sent to is the tag they follow, not the
+        // json the checker reads. `concat!` cannot build the URL from the
+        // constant, so this is where the two are held together.
+        assert!(NIGHTLY_RELEASE_URL.ends_with(&format!("/releases/tag/{NIGHTLY_TAG}")));
         assert!(RELEASES_URL.starts_with("https://github.com/cloudy-liu/tty7/"));
         assert!(NIGHTLY_RELEASE_URL.starts_with("https://github.com/cloudy-liu/tty7/"));
-        assert!(release_endpoint(UpdateChannel::Stable).ends_with("/releases/latest"));
-        assert!(
-            release_endpoint(UpdateChannel::Nightly)
-                .ends_with(&format!("/releases/tags/{NIGHTLY_TAG}"))
+    }
+
+    #[test]
+    fn latest_redirect_location_yields_the_tag() {
+        assert_eq!(
+            tag_from_release_location(
+                "https://github.com/cloudy-liu/tty7/releases/tag/v26.8.3-c.1"
+            ),
+            Some("v26.8.3-c.1")
         );
-        // The page a Nightly user is sent to has to be the release that feed
-        // reads. `concat!` cannot build the URL from the constant, so this is
-        // where the two are held together.
-        assert!(NIGHTLY_RELEASE_URL.ends_with(&format!("/releases/tag/{NIGHTLY_TAG}")));
+        assert_eq!(
+            tag_from_release_location("/cloudy-liu/tty7/releases/tag/v26.8.3-c.1"),
+            Some("v26.8.3-c.1")
+        );
+        assert_eq!(
+            tag_from_release_location(
+                "https://github.com/cloudy-liu/tty7/releases/tag/v26.8.3-c.1?foo=1#assets"
+            ),
+            Some("v26.8.3-c.1")
+        );
+        assert_eq!(
+            tag_from_release_location("https://github.com/cloudy-liu/tty7/releases/latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn published_assets_are_github_download_urls() {
+        let assets = published_gui_assets("v26.8.3-c.1", "26.8.3-c.1");
+        let checksums = assets
+            .iter()
+            .find(|asset| asset.name == "checksums.txt")
+            .expect("checksums.txt");
+        assert_eq!(
+            checksums.browser_download_url,
+            "https://github.com/cloudy-liu/tty7/releases/download/v26.8.3-c.1/checksums.txt"
+        );
+        assert!(
+            assets
+                .iter()
+                .any(|asset| asset.name == "tty7-26.8.3-c.1-windows-x86_64-setup.exe")
+        );
+
+        let nightly = published_gui_assets("nightly", "26.8.2-nightly.20260807");
+        let setup = nightly
+            .iter()
+            .find(|asset| asset.name.ends_with("-windows-x86_64-setup.exe"))
+            .expect("windows setup");
+        assert_eq!(
+            setup.browser_download_url,
+            "https://github.com/cloudy-liu/tty7/releases/download/nightly/tty7-26.8.2-nightly.20260807-windows-x86_64-setup.exe"
+        );
     }
 
     /// The fallback for a nightly published without `nightly.json`. The tag is
