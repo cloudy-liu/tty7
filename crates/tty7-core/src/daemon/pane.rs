@@ -1550,7 +1550,7 @@ impl DaemonPane {
                 foreground_command_running(&fg_master, shell_pid, reports_command_start)
             },
             ForegroundProbes {
-                remote: Box::new(move || foreground_remote_context(&remote_master)),
+                remote: Box::new(move || foreground_remote_context(&remote_master, shell_pid)),
                 agent: Box::new(move || {
                     foreground_agent(&agent_master, shell_pid, &process_agent_seen, &agent_state)
                 }),
@@ -2310,7 +2310,7 @@ impl DaemonPane {
 
     fn foreground_remote_context(&self) -> Option<RemoteContext> {
         match &self.backend {
-            PaneBackend::Pty(p) => foreground_remote_context(&p.master),
+            PaneBackend::Pty(p) => foreground_remote_context(&p.master, p.shell_pid),
             PaneBackend::NativeSsh(_) => None,
         }
     }
@@ -2958,6 +2958,7 @@ fn foreground_cwd(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn foreground_remote_context(
     master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    _shell_pid: Option<u32>,
 ) -> Option<RemoteContext> {
     let pid = master
         .lock()
@@ -2967,9 +2968,18 @@ fn foreground_remote_context(
     crate::daemon::remote::parse_ssh_invocation(&argv).map(|inv| inv.context)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
 fn foreground_remote_context(
     _master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    shell_pid: Option<u32>,
+) -> Option<RemoteContext> {
+    crate::daemon::winproc::foreground_ssh(shell_pid?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn foreground_remote_context(
+    _master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    _shell_pid: Option<u32>,
 ) -> Option<RemoteContext> {
     None
 }

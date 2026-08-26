@@ -1352,6 +1352,7 @@ impl RemoteTerminal {
                                 if let Ok(mut guard) = remote.lock() {
                                     *guard = ctx;
                                 }
+                                proxy.send_event(AlacEvent::Wakeup);
                             }
                             DaemonMsg::AuthPrompt { request_id, prompt } => {
                                 flush_batch!();

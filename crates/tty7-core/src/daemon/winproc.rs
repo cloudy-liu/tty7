@@ -2,6 +2,17 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::core::cli_agent::CLIAgent;
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationProcess(
+        process: windows_sys::Win32::Foundation::HANDLE,
+        info_class: u32,
+        info: *mut core::ffi::c_void,
+        info_len: u32,
+        return_len: *mut u32,
+    ) -> i32;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Proc {
     pub pid: u32,
@@ -82,6 +93,151 @@ pub(crate) fn foreground_agent(
     custom: &std::collections::HashMap<String, String>,
 ) -> Option<(CLIAgent, Vec<String>)> {
     detect_foreground_agent_with(&snapshot(), shell_pid, image_path, custom)
+}
+
+/// The OpenSSH client in this pane's process tree, if one is the hop the
+/// shell is sitting in — the Windows counterpart of reading `ssh` off the
+/// Unix foreground pgid.
+pub(crate) fn foreground_ssh(shell_pid: u32) -> Option<crate::daemon::protocol::RemoteContext> {
+    detect_foreground_ssh_with(&snapshot(), shell_pid, process_argv)
+}
+
+fn detect_foreground_ssh_with<F>(
+    procs: &[Proc],
+    shell_pid: u32,
+    argv_for: F,
+) -> Option<crate::daemon::protocol::RemoteContext>
+where
+    F: Fn(u32) -> Option<Vec<String>>,
+{
+    use crate::daemon::protocol::{RemoteContext, RemoteKind};
+    use crate::daemon::remote::{is_ssh_program, parse_ssh_invocation};
+
+    let ssh_from = |pid: u32, name: &str| -> Option<RemoteContext> {
+        if let Some(argv) = argv_for(pid) {
+            return parse_ssh_invocation(&argv).map(|inv| inv.context);
+        }
+        if !is_ssh_program(name) {
+            return None;
+        }
+        Some(RemoteContext {
+            kind: RemoteKind::Ssh,
+            argv: vec![name.to_string()],
+            target: std::path::Path::new(name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.to_string()),
+        })
+    };
+
+    if let Some(shell) = procs.iter().find(|p| p.pid == shell_pid)
+        && let Some(ctx) = ssh_from(shell.pid, &shell.name)
+    {
+        return Some(ctx);
+    }
+    for (depth, pid, name) in walk(procs, shell_pid) {
+        if depth > AGENT_SCAN_MAX_DEPTH {
+            break;
+        }
+        if let Some(ctx) = ssh_from(pid, name) {
+            return Some(ctx);
+        }
+    }
+    None
+}
+
+/// The process command line, split the way `CommandLineToArgvW` would.
+///
+/// ToolHelp only names the image. An interactive `ssh user@host` hop is
+/// identified by argv; without it we can still see `ssh.exe` in the tree but
+/// not the destination.
+fn process_argv(pid: u32) -> Option<Vec<String>> {
+    let line = process_command_line(pid)?;
+    let argv = split_command_line(&line);
+    (!argv.is_empty()).then_some(argv)
+}
+
+fn process_command_line(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut needed = 0u32;
+        let _ = NtQueryInformationProcess(
+            handle,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 || needed as usize > 64 * 1024 {
+            CloseHandle(handle);
+            return None;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let status = NtQueryInformationProcess(
+            handle,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        );
+        CloseHandle(handle);
+        if status != 0 || (needed as usize) < std::mem::size_of::<UnicodeString>() {
+            return None;
+        }
+        let us = buf.as_ptr().cast::<UnicodeString>();
+        let length = (*us).length as usize / 2;
+        let buffer = (*us).buffer;
+        if buffer.is_null() || length == 0 {
+            return None;
+        }
+        let start = buf.as_ptr() as usize;
+        let end = start + buf.len();
+        let ptr = buffer as usize;
+        if ptr < start || ptr.saturating_add(length.saturating_mul(2)) > end {
+            return None;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+            buffer, length,
+        )))
+    }
+}
+
+/// Whitespace-and-quotes split. Enough for `ssh -p 22 user@host`; it is not
+/// a full `CommandLineToArgvW`.
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in line.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 pub(crate) fn snapshot() -> Vec<Proc> {
@@ -634,6 +790,66 @@ mod tests {
         assert_eq!(
             detected, None,
             "a home-directory name is not an install prefix"
+        );
+    }
+
+    #[test]
+    fn an_ssh_child_of_cmd_is_an_in_pane_hop() {
+        let procs = vec![
+            p(100, 1, "cmd.exe"),
+            p(200, 100, "ssh.exe"),
+            p(999, 1, "explorer.exe"),
+        ];
+        let ctx = detect_foreground_ssh_with(&procs, 100, |_| None).expect("ssh.exe is the hop");
+        assert_eq!(ctx.kind, crate::daemon::protocol::RemoteKind::Ssh);
+        assert_eq!(ctx.target, "ssh");
+    }
+
+    #[test]
+    fn ssh_argv_names_the_destination_when_toolhelp_cannot() {
+        let procs = vec![p(100, 1, "powershell.exe"), p(200, 100, "ssh.exe")];
+        let ctx = detect_foreground_ssh_with(&procs, 100, |pid| {
+            (pid == 200).then(|| {
+                vec![
+                    r"C:\Windows\System32\OpenSSH\ssh.exe".into(),
+                    "user@devbox".into(),
+                ]
+            })
+        })
+        .expect("parsed hop");
+        assert_eq!(ctx.target, "user@devbox");
+    }
+
+    #[test]
+    fn git_and_ssh_agent_are_not_hops() {
+        let git = vec![p(100, 1, "cmd.exe"), p(200, 100, "git.exe")];
+        assert!(detect_foreground_ssh_with(&git, 100, |_| None).is_none());
+
+        let agent = vec![p(100, 1, "cmd.exe"), p(200, 100, "ssh-agent.exe")];
+        assert!(detect_foreground_ssh_with(&agent, 100, |_| None).is_none());
+    }
+
+    #[test]
+    fn a_remote_command_on_ssh_is_not_an_interactive_hop() {
+        let procs = vec![p(100, 1, "cmd.exe"), p(200, 100, "ssh.exe")];
+        assert!(
+            detect_foreground_ssh_with(&procs, 100, |pid| {
+                (pid == 200).then(|| vec!["ssh.exe".into(), "dev".into(), "htop".into()])
+            })
+            .is_none(),
+            "ssh host cmd is not a login hop; the local cwd still belongs here"
+        );
+    }
+
+    #[test]
+    fn split_command_line_keeps_the_host_and_drops_quotes() {
+        assert_eq!(
+            split_command_line(r#"ssh -p 22 user@dev"#),
+            vec!["ssh", "-p", "22", "user@dev"]
+        );
+        assert_eq!(
+            split_command_line(r#"ssh -F "C:\Program Files\config" box"#),
+            vec!["ssh", "-F", r"C:\Program Files\config", "box"]
         );
     }
 

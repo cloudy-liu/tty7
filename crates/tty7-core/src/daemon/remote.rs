@@ -8,10 +8,17 @@ pub(crate) struct SshInvocation {
     pub forward_args: Vec<String>,
 }
 
+/// Whether `program` is the OpenSSH client — `ssh`, `ssh.exe`, or a path
+/// whose stem is `ssh`. `ssh-agent` / `sshd` / `scp` stay out.
+pub(crate) fn is_ssh_program(program: &str) -> bool {
+    Path::new(program)
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("ssh"))
+}
+
 pub(crate) fn parse_ssh_invocation(argv: &[String]) -> Option<SshInvocation> {
     let program = argv.first()?;
-    let name = Path::new(program).file_name()?.to_string_lossy();
-    if name != "ssh" {
+    if !is_ssh_program(program) {
         return None;
     }
 
@@ -228,6 +235,22 @@ mod tests {
         let inv = parse_ssh_invocation(&argv(&["ssh", "user@dev"])).unwrap();
         assert_eq!(inv.context.target, "user@dev");
         assert_eq!(inv.forward_args, Vec::<String>::new());
+    }
+
+    #[test]
+    fn windows_ssh_exe_is_the_same_program() {
+        assert!(is_ssh_program("ssh"));
+        assert!(is_ssh_program("ssh.exe"));
+        assert!(is_ssh_program(r"C:\Windows\System32\OpenSSH\ssh.exe"));
+        assert!(is_ssh_program("SSH.EXE"));
+        assert!(!is_ssh_program("ssh-agent.exe"));
+        assert!(!is_ssh_program("sshd"));
+        assert!(!is_ssh_program("scp"));
+
+        let inv =
+            parse_ssh_invocation(&argv(&[r"C:\Windows\System32\OpenSSH\ssh.exe", "user@dev"]))
+                .unwrap();
+        assert_eq!(inv.context.target, "user@dev");
     }
 
     #[test]
