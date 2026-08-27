@@ -460,11 +460,10 @@ impl CLIAgent {
             CLIAgent::OhMyPi => "icons/agents/omp.svg",
             CLIAgent::Qwen => "icons/agents/qwen.svg",
             CLIAgent::Kimi => "icons/agents/kimi.svg",
-            CLIAgent::Aider
-            | CLIAgent::Auggie
-            | CLIAgent::Hermes
-            | CLIAgent::Vibe
-            | CLIAgent::Antigravity => "icons/bot.svg",
+            CLIAgent::Antigravity => "icons/agents/antigravity.svg",
+            CLIAgent::Aider | CLIAgent::Auggie | CLIAgent::Hermes | CLIAgent::Vibe => {
+                "icons/bot.svg"
+            }
         }
     }
 
@@ -973,16 +972,21 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_uses_its_brand_mark() {
+        assert_eq!(
+            CLIAgent::Antigravity.icon_path(),
+            "icons/agents/antigravity.svg"
+        );
+    }
+
+    #[test]
     fn only_the_unbranded_agents_use_the_fallback_glyph() {
         let fallback: Vec<&str> = CLIAgent::ALL
             .into_iter()
             .filter(|a| a.icon_path() == "icons/bot.svg")
             .map(CLIAgent::slug)
             .collect();
-        assert_eq!(
-            fallback,
-            ["aider", "auggie", "hermes", "vibe", "antigravity"]
-        );
+        assert_eq!(fallback, ["aider", "auggie", "hermes", "vibe"]);
         assert!(
             !fallback.contains(&"omp"),
             "Oh My Pi ships its own mark and must not fall back"
