@@ -95,6 +95,10 @@ struct ReaderSignals {
     /// [`crate::terminal::agent_marks`]. The daemon reads the same events for
     /// the status dot, but only the client holds the rows they point into.
     turns: AgentTurns,
+    /// ConPTY asked the host to encode keys as `KEY_EVENT_RECORD`s
+    /// (`CSI ? 9001 h`). Sticky across reconnect: the handshake is often not
+    /// in a later snapshot.
+    win32_input: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -509,6 +513,10 @@ pub struct RemoteTerminal {
     /// The conversation's shape, for the outline in the Info panel: one entry
     /// per agent turn, anchored to the scrollback row it began on.
     turns: AgentTurns,
+    /// ConPTY asked the host to encode keys as `KEY_EVENT_RECORD`s
+    /// (`CSI ? 9001 h`). Cloned into each reader so a relink keeps the latch:
+    /// the handshake is typically not in a later snapshot.
+    win32_input: Arc<AtomicBool>,
     route: PaneRoute,
     proxy: EventProxy,
     reader_thread: Option<JoinHandle<()>>,
@@ -808,6 +816,7 @@ impl RemoteTerminal {
                 phase: self.ssh_phase.clone(),
                 images: self.images.clone(),
                 turns: self.turns.clone(),
+                win32_input: self.win32_input.clone(),
             },
         );
         self.reader_thread = Some(reader);
@@ -860,6 +869,7 @@ impl RemoteTerminal {
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
         let images = crate::terminal::images::ImageStore::new();
         let turns = AgentTurns::new();
+        let win32_input = Arc::new(AtomicBool::new(false));
 
         let reader_quit = Arc::new(AtomicBool::new(false));
         let reader_thread = Self::spawn_reader(
@@ -883,6 +893,7 @@ impl RemoteTerminal {
                 phase: ssh_phase.clone(),
                 images: images.clone(),
                 turns: turns.clone(),
+                win32_input: win32_input.clone(),
             },
         );
 
@@ -917,6 +928,7 @@ impl RemoteTerminal {
             agent_session,
             images,
             turns,
+            win32_input,
             route: PaneRoute::Local,
             proxy,
             reader_thread: Some(reader_thread),
@@ -1000,6 +1012,7 @@ impl RemoteTerminal {
                     phase,
                     images,
                     turns,
+                    win32_input,
                 } = signals;
                 crate::core::threads::promote_to_user_interactive();
                 let mut stream = read_half;
@@ -1010,6 +1023,7 @@ impl RemoteTerminal {
                 let mut cursor_scan = ParkedCursorScanner::new();
                 let mut parked_cursor = ParkedCursorRepair::default();
                 let mut turn_scan = AgentTurnScanner::new();
+                let mut win32_scan = crate::terminal::win32_input::Win32InputModeScanner::new();
                 let mut pending: Vec<u8> = buffered;
                 // Kitty-graphics decode runs on its own thread with newest-frame
                 // coalescing (issue #213): inflating a full-window browser frame
@@ -1105,6 +1119,9 @@ impl RemoteTerminal {
                                 for (title, body) in notes {
                                     notify_desktop(title.as_deref(), &body);
                                 }
+                                win32_scan.feed(&out_batch, |on| {
+                                    win32_input.store(on, Ordering::Relaxed);
+                                });
                                 mode_tok.feed(&out_batch, |payload| {
                                     if let Some(mode) = payload.strip_prefix(b"133;V;") {
                                         shell_vi_mode.store(
@@ -1211,6 +1228,9 @@ impl RemoteTerminal {
                                 cursor_scan.reset();
                                 parked_cursor.reset();
                                 turn_scan.reset();
+                                // Parse state only — the latch is sticky, because
+                                // a later snapshot often omits the 9001 handshake.
+                                win32_scan.reset();
                                 proxy.replaying.store(true, Ordering::Relaxed);
                                 // A replayed ring is the pane's own history
                                 // coming back, agent events and all, so cut it
@@ -1242,6 +1262,9 @@ impl RemoteTerminal {
                                             Ordering::Relaxed,
                                         );
                                     }
+                                });
+                                win32_scan.feed(&bytes, |on| {
+                                    win32_input.store(on, Ordering::Relaxed);
                                 });
                                 proxy.replaying.store(false, Ordering::Relaxed);
                                 proxy.send_event(AlacEvent::Wakeup);
@@ -1601,6 +1624,11 @@ impl RemoteTerminal {
 
     pub fn shell_vi_mode(&self) -> bool {
         self.shell_vi_mode.load(Ordering::Relaxed)
+    }
+
+    /// Whether ConPTY asked this pane to encode keys as `KEY_EVENT_RECORD`s.
+    pub fn win32_input_mode(&self) -> bool {
+        self.win32_input.load(Ordering::Relaxed)
     }
 
     /// The line the shell reported running, still percent-escaped. Empty at a
@@ -3127,6 +3155,58 @@ mod tests {
                 .mode()
                 .contains(TermMode::DISAMBIGUATE_ESC_CODES)
         );
+    }
+
+    #[test]
+    fn win32_input_mode_follows_conpty_handshake_and_survives_a_snapshot() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        let poll = |want: bool| {
+            for _ in 0..200 {
+                if term.win32_input_mode() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+        assert!(
+            !term.win32_input_mode(),
+            "conservative false before ConPTY asks"
+        );
+
+        DaemonMsg::Output(b"\x1b[?9001h".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(true), "live 9001h must latch the flag");
+
+        DaemonMsg::Snapshot(b"hello".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        let mut synced = false;
+        for _ in 0..200 {
+            let c = term.term.lock().grid()[alacritty_terminal::index::Line(0)]
+                [alacritty_terminal::index::Column(0)]
+            .c;
+            if c == 'h' {
+                synced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(synced, "reader should have applied the snapshot");
+        assert!(
+            term.win32_input_mode(),
+            "a snapshot without 9001h must not drop the latch"
+        );
+
+        DaemonMsg::Output(b"\x1b[?9001l".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(false), "live 9001l must clear the flag");
     }
 
     #[test]

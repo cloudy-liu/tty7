@@ -28,6 +28,7 @@ mod size;
 mod smart_select;
 mod typeahead;
 pub mod view;
+mod win32_input;
 
 pub(crate) use remote::notify_desktop;
 pub use remote::{PaneRoute, PaneWorkspace, RemoteTerminal, attach_unanswered};
