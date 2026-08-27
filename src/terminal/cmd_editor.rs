@@ -175,6 +175,14 @@ impl CmdEditor {
                 return (s, e + 1);
             }
         }
+        if smart && self.chars.contains(&'\\') {
+            let text: String = self.chars.iter().collect();
+            if let Some((s, e)) =
+                super::smart_select::smart_range(&text, &self.chars, idx, separators)
+            {
+                return (s, e + 1);
+            }
+        }
         self.plain_word_bounds(idx, separators, smart)
     }
 
@@ -657,6 +665,16 @@ mod tests {
         let mut e = ed("cat ./a-b/c_d.txt", 0);
         e.select_word_at(8, SEPS, true);
         assert_eq!(e.selected_text().as_deref(), Some("./a-b/c_d.txt"));
+    }
+
+    #[test]
+    fn select_word_keeps_windows_paths_together() {
+        for path in [r"G:\tools\dev\perfbox-agent", r".venv\Scripts\activate.bat"] {
+            let mut e = ed(path, 0);
+            let click = path.find('e').unwrap_or(0);
+            e.select_word_at(path[..click].chars().count(), SEPS, true);
+            assert_eq!(e.selected_text().as_deref(), Some(path));
+        }
     }
 
     #[test]

@@ -6917,6 +6917,13 @@ fn wrapped_click_index(
     if target > end_row {
         return clamp.then_some(len);
     }
+    // The cells before `scol` on the first row belong to the shell-rendered
+    // prompt, not to the inline editor. A non-clamped click must fall through
+    // so the terminal grid can select that prompt text; a drag that started in
+    // the editor still clamps to the beginning of the command.
+    if target == 0 && col < scol {
+        return clamp.then_some(0);
+    }
     for (i, &(pr, pc, pw)) in positions.iter().enumerate() {
         if pr == target && col >= pc && col < pc + pw {
             return Some(i);
@@ -8403,8 +8410,17 @@ mod tests {
     fn wrapped_click_index_hits_chars_on_the_first_row() {
         assert_eq!(click("git", 4, 80, 4, 0), Some(0));
         assert_eq!(click("git", 4, 80, 6, 0), Some(2));
-        assert_eq!(click("git", 4, 80, 1, 0), Some(0));
+        assert_eq!(click("git", 4, 80, 1, 0), None);
         assert_eq!(click("git", 4, 80, 40, 0), Some(3));
+    }
+
+    #[test]
+    fn wrapped_click_index_leaves_the_prompt_prefix_to_the_grid() {
+        let chars: Vec<char> = "echo hi".chars().collect();
+        assert_eq!(wrapped_click_index(&chars, 12, 80, 4, 0, false), None);
+        assert_eq!(wrapped_click_index(&chars, 12, 80, 4, 0, true), Some(0));
+        assert_eq!(wrapped_click_index(&[], 12, 80, 4, 0, false), None);
+        assert_eq!(wrapped_click_index(&[], 12, 80, 12, 0, false), Some(0));
     }
 
     #[test]
