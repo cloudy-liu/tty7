@@ -420,6 +420,7 @@ fn regexes() -> &'static [Regex] {
         [
             r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
             r"\b[0-9]+(?:\.[0-9]+)?[eE][+-]?[0-9]+\b",
+            r"(?:[A-Za-z]:)?[A-Za-z0-9._+@%~-]*(?:\\[A-Za-z0-9._+@%~-]+)+\\?",
             r"[A-Za-z0-9._+@%~-]*(?:/[A-Za-z0-9._+@%~-]+)+/?",
             r"[0-9A-Za-z_]+(?:[.-][0-9A-Za-z_]+)*",
         ]
@@ -750,6 +751,35 @@ mod tests {
         let text = "error:/tmp/x/y";
         let click = text.find("tmp").unwrap();
         assert_eq!(range(text, click), None);
+    }
+
+    #[test]
+    fn windows_paths_expand_past_drive_and_backslash_boundaries() {
+        let text = r"G:\tools\dev\perfbox-agent";
+        for needle in ["G", "tools", "agent"] {
+            let byte = text.find(needle).unwrap();
+            let click = text[..byte].chars().count();
+            assert_eq!(
+                selected(text, click).as_deref(),
+                Some(text),
+                "{text:?} clicked at {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_paths_in_the_prompt_select_as_one_grid_range() {
+        let path = r"G:\tools\dev\perfbox-agent";
+        let line = format!("(.venv) {path}>");
+        let term = term_with(80, 2, &line);
+        for needle in ["G", "tools", "agent"] {
+            let col = line.find(needle).unwrap();
+            assert_eq!(
+                grid_select(&term, 0, col).as_deref(),
+                Some(path),
+                "{line:?} clicked at {needle:?}"
+            );
+        }
     }
 
     #[test]
