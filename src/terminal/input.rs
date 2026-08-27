@@ -6,7 +6,8 @@ use super::view::TerminalView;
 use crate::core::config::Config;
 
 /// Everything about the terminal's current state that changes how a keystroke
-/// is encoded: the kitty protocol flags, plus DECCKM (application cursor keys).
+/// is encoded: the kitty protocol flags, ConPTY's win32-input-mode latch, plus
+/// DECCKM (application cursor keys).
 #[derive(Clone, Copy, Default)]
 pub(super) struct KeyFlags {
     disambiguate: bool,
@@ -15,6 +16,9 @@ pub(super) struct KeyFlags {
     /// DECCKM. ncurses apps turn this on via `smkx` and then only recognise the
     /// SS3 form of the arrow keys, because that is what `kcuu1` & co. spell.
     app_cursor: bool,
+    /// ConPTY asked the host to encode keys as `KEY_EVENT_RECORD`s
+    /// (`CSI ? 9001 h`). Shift+Enter is the chord that needs it.
+    win32_input: bool,
 }
 
 impl KeyFlags {
@@ -24,11 +28,21 @@ impl KeyFlags {
             report_all_keys: mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC),
             report_text: mode.contains(TermMode::REPORT_ASSOCIATED_TEXT),
             app_cursor: mode.contains(TermMode::APP_CURSOR),
+            win32_input: false,
         }
+    }
+
+    pub(super) fn with_win32_input(mut self, on: bool) -> Self {
+        self.win32_input = on;
+        self
     }
 
     pub(super) fn kitty_active(self) -> bool {
         self.disambiguate || self.report_all_keys
+    }
+
+    pub(super) fn win32_input(self) -> bool {
+        self.win32_input
     }
 
     pub(super) fn app_cursor(self) -> bool {
@@ -98,7 +112,24 @@ pub(super) fn keystroke_to_bytes(ks: &gpui::Keystroke, flags: KeyFlags) -> Optio
             return Some(bytes);
         }
     }
+    // Kitty wins when the application asked for it (Claude Code, Cursor, Agy).
+    // Otherwise ConPTY's win32-input-mode is what lets Codex see Shift+Enter.
+    if flags.win32_input() && !ks.modifiers.platform {
+        if let Some(bytes) = encode_win32(ks) {
+            return Some(bytes);
+        }
+    }
     legacy_keystroke_to_bytes(ks, flags)
+}
+
+fn encode_win32(ks: &gpui::Keystroke) -> Option<Vec<u8>> {
+    let m = &ks.modifiers;
+    if ks.key.as_str() != "enter" || !(m.shift || m.alt || m.control) {
+        return None;
+    }
+    Some(super::win32_input::encode_win32_enter(
+        m.shift, m.alt, m.control,
+    ))
 }
 
 pub(super) fn tab_bytes(shift: bool, flags: KeyFlags) -> Vec<u8> {
@@ -461,16 +492,14 @@ mod tests {
             disambiguate: true,
             report_all_keys: true,
             report_text: true,
-            app_cursor: false,
+            ..Default::default()
         }
     }
 
     fn disambiguate_only() -> KeyFlags {
         KeyFlags {
             disambiguate: true,
-            report_all_keys: false,
-            report_text: false,
-            app_cursor: false,
+            ..Default::default()
         }
     }
 
@@ -818,9 +847,14 @@ mod tests {
     fn kitty() -> KeyFlags {
         KeyFlags {
             disambiguate: true,
-            report_all_keys: false,
-            report_text: false,
-            app_cursor: false,
+            ..Default::default()
+        }
+    }
+
+    fn win32() -> KeyFlags {
+        KeyFlags {
+            win32_input: true,
+            ..Default::default()
         }
     }
 
@@ -896,12 +930,47 @@ mod tests {
     }
 
     #[test]
+    fn win32_mode_encodes_shift_enter_as_a_key_event() {
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keystroke_to_bytes(&ks(shift, "enter", None), win32()),
+            Some(b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_".to_vec())
+        );
+        let none = Modifiers::default();
+        assert_eq!(
+            keystroke_to_bytes(&ks(none, "enter", None), win32()),
+            Some(b"\r".to_vec()),
+            "plain Enter stays CR; only modified Enter needs the KEY_EVENT form"
+        );
+    }
+
+    #[test]
+    fn kitty_wins_over_win32_for_shift_enter() {
+        let both = KeyFlags {
+            disambiguate: true,
+            win32_input: true,
+            ..Default::default()
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keystroke_to_bytes(&ks(shift, "enter", None), both),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+    }
+
+    #[test]
     fn kitty_report_all_keys_escapes_plain_enter_tab_backspace() {
         let full = KeyFlags {
             disambiguate: true,
             report_all_keys: true,
             report_text: false,
-            app_cursor: false,
+            ..Default::default()
         };
         let none = Modifiers::default();
         assert_eq!(
@@ -929,7 +998,7 @@ mod tests {
             disambiguate: true,
             report_all_keys: true,
             report_text: false,
-            app_cursor: false,
+            ..Default::default()
         };
         assert_eq!(tab_bytes(false, full), b"\x1b[9u".to_vec());
     }
@@ -990,7 +1059,7 @@ mod tests {
             disambiguate: true,
             report_all_keys: true,
             report_text: true,
-            app_cursor: false,
+            ..Default::default()
         };
         let none = Modifiers::default();
         assert_eq!(
@@ -1005,7 +1074,7 @@ mod tests {
             disambiguate: true,
             report_all_keys: true,
             report_text: true,
-            app_cursor: false,
+            ..Default::default()
         };
         let none = Modifiers::default();
         assert_eq!(
