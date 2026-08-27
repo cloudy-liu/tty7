@@ -11,7 +11,8 @@ pub(crate) struct SshInvocation {
 /// Whether `program` is the OpenSSH client — `ssh`, `ssh.exe`, or a path
 /// whose stem is `ssh`. `ssh-agent` / `sshd` / `scp` stay out.
 pub(crate) fn is_ssh_program(program: &str) -> bool {
-    Path::new(program)
+    let file_name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    Path::new(file_name)
         .file_stem()
         .is_some_and(|stem| stem.eq_ignore_ascii_case("ssh"))
 }

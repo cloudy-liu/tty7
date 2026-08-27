@@ -9225,14 +9225,32 @@ mod gpui_tests {
     /// sidebar, because Windows never marked the pane remote.
     #[gpui::test]
     fn an_ssh_hop_drops_the_local_git_status(cx: &mut TestAppContext) {
+        use std::io::Write as _;
+
+        let local_cwd = std::path::PathBuf::from("/repo");
         let (window, mut daemon) = harness(cx);
+        DaemonMsg::Cwd(local_cwd.clone())
+            .encode(&mut daemon)
+            .unwrap();
+        daemon.flush().unwrap();
+        for _ in 0..200 {
+            let seen = window
+                .update(cx, |view, _, _| view.cwd().as_ref() == Some(&local_cwd))
+                .unwrap();
+            if seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
         window
             .update(cx, |view, window, cx| {
-                view.git_status_cwd = Some(std::path::PathBuf::from(r"G:\tools\dev\perfbox"));
+                assert_eq!(view.cwd(), Some(local_cwd.clone()));
                 view.poll_foreground(window, cx);
-                assert!(
-                    view.git_status_cwd.is_some(),
-                    "still a local working tree until ssh is seen"
+                assert_eq!(
+                    view.git_status_cwd.as_deref(),
+                    Some(local_cwd.as_path()),
+                    "the local working tree stays until ssh is seen"
                 );
             })
             .unwrap();
@@ -9244,6 +9262,7 @@ mod gpui_tests {
         }))
         .encode(&mut daemon)
         .unwrap();
+        daemon.flush().unwrap();
         for _ in 0..200 {
             let seen = window
                 .update(cx, |view, _, _| view.remote_context().is_some())
