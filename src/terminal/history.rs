@@ -110,6 +110,8 @@ pub fn load_with_shell_files(scope: &Scope, shell_files: Vec<(String, Vec<u8>)>)
 }
 
 const FISH_HISTORY_FILE: &str = "fish_history";
+const POWERSHELL_HISTORY_FILE: &str = "ConsoleHost_history.txt";
+const CLINK_HISTORY_FILE: &str = "clink_history";
 
 /// fish's history relative to the XDG data dir, and relative to `$HOME` when
 /// that dir is the default `~/.local/share`. `shell_history_names` returns the
@@ -319,6 +321,37 @@ fn load_shell_history() -> Vec<Raw> {
     } else if let Some(home) = std::env::var_os("HOME") {
         add(PathBuf::from(home).join(FISH_HISTORY_UNDER_HOME));
     }
+    #[cfg(not(windows))]
+    {
+        // PSReadLine follows XDG on Unix-like systems and uses HOME as its
+        // fallback, just like fish does above.
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+            add(PathBuf::from(xdg)
+                .join("powershell/PSReadLine")
+                .join(POWERSHELL_HISTORY_FILE));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            add(PathBuf::from(home)
+                .join(".local/share/powershell/PSReadLine")
+                .join(POWERSHELL_HISTORY_FILE));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        let localappdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let clink_profile = std::env::var_os("CLINK_PROFILE").map(PathBuf::from);
+        let cmder_user_config = std::env::var_os("CMDER_USER_CONFIG").map(PathBuf::from);
+        let cmder_config_dir = std::env::var_os("CMDER_CONFIG_DIR").map(PathBuf::from);
+        for path in windows_shell_history_paths(
+            appdata.as_deref(),
+            localappdata.as_deref(),
+            clink_profile.as_deref(),
+            cmder_user_config.as_deref(),
+            cmder_config_dir.as_deref(),
+        ) {
+            add(path);
+        }
+    }
     files.sort_by_key(|p| {
         std::fs::metadata(p)
             .and_then(|m| m.modified())
@@ -335,13 +368,83 @@ fn load_shell_history() -> Vec<Raw> {
     out
 }
 
+#[cfg(windows)]
+fn windows_shell_history_paths(
+    appdata: Option<&Path>,
+    localappdata: Option<&Path>,
+    clink_profile: Option<&Path>,
+    cmder_user_config: Option<&Path>,
+    cmder_config_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(appdata) = appdata {
+        // This is PSReadLine's default ConsoleHost path for Windows
+        // PowerShell and PowerShell 7.
+        paths.push(
+            appdata
+                .join("Microsoft/Windows/PowerShell/PSReadLine")
+                .join(POWERSHELL_HISTORY_FILE),
+        );
+    }
+
+    let profile = clink_profile
+        .or(cmder_user_config)
+        .or(cmder_config_dir)
+        .map(Path::to_path_buf)
+        .or_else(|| localappdata.map(|root| root.join("clink")));
+    if let Some(profile) = profile {
+        // CLINK_PROFILE takes precedence over Clink's default profile.
+        paths.push(profile.join(CLINK_HISTORY_FILE));
+    }
+    paths
+}
+
 /// Which reader a history file gets, by file name. The remote side has only
 /// bytes and a name, so the choice has to hang off the name in both paths.
 fn parse_history_file(name: &str, content: &str, out: &mut Vec<Raw>) {
     if name == FISH_HISTORY_FILE {
         parse_fish_history(content, out);
+    } else if name == POWERSHELL_HISTORY_FILE {
+        parse_powershell_history(content, out);
+    } else if name == CLINK_HISTORY_FILE {
+        parse_clink_history(content, out);
     } else {
         parse_shell_history(content, out);
+    }
+}
+
+/// PSReadLine writes an embedded newline as a trailing backtick followed by a
+/// physical newline. tty7's history menus still hold one display row per
+/// command, so omit the complete multiline record instead of exposing each
+/// physical line as a command that never existed. The live shell remains the
+/// source of truth for Up/Down and can recall the multiline record itself.
+fn parse_powershell_history(content: &str, out: &mut Vec<Raw>) {
+    let mut multiline = false;
+    for raw in content.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let continues = line.ends_with('`');
+        if multiline {
+            multiline = continues;
+            continue;
+        }
+        if continues {
+            multiline = true;
+        } else if !line.is_empty() {
+            out.push(Raw::bare(line.to_string()));
+        }
+    }
+}
+
+/// Clink stores one command per line. Its first `|CTAG` line is a file-format
+/// marker, and a deleted command is tombstoned by replacing its first
+/// character with `|`; neither should be offered as a command to recall.
+fn parse_clink_history(content: &str, out: &mut Vec<Raw>) {
+    for raw in content.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.is_empty() || line.starts_with('|') {
+            continue;
+        }
+        out.push(Raw::bare(line.to_string()));
     }
 }
 
@@ -491,6 +594,12 @@ mod tests {
         out.into_iter().map(|r| (r.cmd, r.ts)).collect()
     }
 
+    fn parse_clink(content: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        parse_history_file(CLINK_HISTORY_FILE, content, &mut out);
+        out.into_iter().map(|r| r.cmd).collect()
+    }
+
     #[test]
     fn fish_history_entries_carry_cmd_and_timestamp() {
         let content =
@@ -594,6 +703,60 @@ mod tests {
     fn fish_history_garbage_is_skipped() {
         assert_eq!(parse_fish("not a record at all\n- cmd:\n"), []);
         assert_eq!(parse_fish(""), []);
+    }
+
+    #[test]
+    fn clink_history_skips_metadata_and_deleted_entries() {
+        let content = "|CTAG1.0\nG:\\tools\\dev\\perfbox-agent\n|cho stale\nwhere git\r\n";
+        assert_eq!(
+            parse_clink(content),
+            [r"G:\tools\dev\perfbox-agent", "where git"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_history_paths_cover_psreadline_and_clink() {
+        let appdata = Path::new(r"C:\Users\me\AppData\Roaming");
+        let localappdata = Path::new(r"C:\Users\me\AppData\Local");
+        let profile = Path::new(r"D:\portable\clink");
+
+        assert_eq!(
+            windows_shell_history_paths(
+                Some(appdata),
+                Some(localappdata),
+                Some(profile),
+                None,
+                None,
+            ),
+            vec![
+                appdata
+                    .join(r"Microsoft\Windows\PowerShell\PSReadLine")
+                    .join(POWERSHELL_HISTORY_FILE),
+                profile.join(CLINK_HISTORY_FILE),
+            ]
+        );
+        assert_eq!(
+            windows_shell_history_paths(Some(appdata), Some(localappdata), None, None, None,),
+            vec![
+                appdata
+                    .join(r"Microsoft\Windows\PowerShell\PSReadLine")
+                    .join(POWERSHELL_HISTORY_FILE),
+                localappdata.join("clink").join(CLINK_HISTORY_FILE),
+            ]
+        );
+        let cmder_profile = Path::new(r"E:\cmder\config");
+        assert_eq!(
+            windows_shell_history_paths(
+                Some(appdata),
+                Some(localappdata),
+                None,
+                Some(cmder_profile),
+                None,
+            )
+            .last(),
+            Some(&cmder_profile.join(CLINK_HISTORY_FILE))
+        );
     }
 
     #[test]
@@ -1005,6 +1168,24 @@ mod tests {
                 exit: None,
             }),
             "zsh's second field is elapsed seconds, not an exit code"
+        );
+    }
+
+    #[test]
+    fn psreadline_multiline_records_do_not_become_partial_commands() {
+        crate::core::config::pin_test_config_dir();
+
+        let scope = Scope::remote("me@powershell-history");
+        let history =
+            b"Get-Date\r\nGet-ChildItem `\r\n  | Where-Object Length -gt 1MB\r\nGet-Location\r\n"
+                .to_vec();
+        let loaded =
+            load_with_shell_files(&scope, vec![(POWERSHELL_HISTORY_FILE.to_string(), history)]);
+
+        assert_eq!(
+            loaded.entries,
+            ["Get-Date", "Get-Location"],
+            "a PSReadLine continuation is one unsupported multiline record, not two fake commands"
         );
     }
 

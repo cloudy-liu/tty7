@@ -3327,6 +3327,19 @@ mod tests {
     use crate::core::kitty_graphics::ImageDelete;
     use std::path::Path;
 
+    #[cfg(windows)]
+    fn append_cmd_output(pane: &DaemonPane, transcript: &mut Vec<u8>, bytes: &[u8]) {
+        let scan_from = transcript.len().saturating_sub(2);
+        transcript.extend_from_slice(bytes);
+        let replies = transcript[scan_from..]
+            .windows(3)
+            .filter(|window| *window == b"\x1b[c")
+            .count();
+        for _ in 0..replies {
+            pane.write_input(b"\x1b[?62;c");
+        }
+    }
+
     #[test]
     fn a_shell_that_cannot_run_is_named_once_not_wrapped_four_deep() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3502,6 +3515,127 @@ mod tests {
         assert!(
             matches!(prompt, Some((true, true, _))),
             "a selected cmd.exe pane never reported an editable prompt; last report: {prompt:?}"
+        );
+    }
+
+    /// The UI hands a one-line draft to cmd and follows it with CSI Up. Keep a
+    /// real ConPTY and DOSKEY in this test so that pair of writes must recall
+    /// and execute the complete command, not merely look correct on the wire.
+    #[cfg(windows)]
+    #[test]
+    fn live_cmd_up_replays_the_complete_activation_command() {
+        const MARKER: &[u8] = b"TTY7_ACTIVATE_HISTORY_OK";
+
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let scripts = fixture.path().join(".venv").join("Scripts");
+        std::fs::create_dir_all(&scripts).expect("create virtualenv fixture");
+        std::fs::write(
+            scripts.join("activate.bat"),
+            b"@echo TTY7_ACTIVATE_HISTORY_OK\r\n",
+        )
+        .expect("write activation fixture");
+
+        let cmd =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let (tx, rx) = mpsc::channel();
+        let pane = DaemonPane::spawn(
+            5,
+            Some(fixture.path().to_path_buf()),
+            ws(80, 24),
+            Some(ShellSpec {
+                program: cmd,
+                args: vec!["/D".into()],
+                args_are_tty7_defaults: true,
+            }),
+            None,
+            None,
+            None,
+            || {},
+        )
+        .expect("spawn cmd pane");
+        pane.attach(tx);
+
+        let mut transcript = Vec::new();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut armed = false;
+        while std::time::Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            match msg {
+                DaemonMsg::Snapshot(bytes) | DaemonMsg::Output(bytes) => {
+                    append_cmd_output(&pane, &mut transcript, &bytes);
+                }
+                DaemonMsg::Prompt {
+                    active: true,
+                    at_prompt: true,
+                    ..
+                } => {
+                    armed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(armed, "cmd never reached its first editable prompt");
+
+        pane.write_input(b".venv\\Scripts\\activate.bat\r");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut first_run = false;
+        let mut rearmed = false;
+        while std::time::Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            match msg {
+                DaemonMsg::Snapshot(bytes) | DaemonMsg::Output(bytes) => {
+                    append_cmd_output(&pane, &mut transcript, &bytes);
+                    first_run |= transcript.windows(MARKER.len()).any(|w| w == MARKER);
+                }
+                DaemonMsg::Prompt {
+                    active: true,
+                    at_prompt: true,
+                    ..
+                } if first_run => {
+                    rearmed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            first_run,
+            "the activation fixture did not run the first time"
+        );
+        assert!(rearmed, "cmd did not return to its prompt after activation");
+
+        while rx.try_recv().is_ok() {}
+        transcript.clear();
+        pane.write_input(b".venv\\");
+        pane.write_input(b"\x1b[A");
+        pane.write_input(b"\r");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut recalled = false;
+        while std::time::Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            if let DaemonMsg::Snapshot(bytes) | DaemonMsg::Output(bytes) = msg {
+                append_cmd_output(&pane, &mut transcript, &bytes);
+                if transcript.windows(MARKER.len()).any(|w| w == MARKER) {
+                    recalled = true;
+                    break;
+                }
+            }
+        }
+        pane.kill();
+
+        assert!(
+            recalled,
+            "draft + Up did not recall and execute .venv\\Scripts\\activate.bat; transcript: {:?}",
+            String::from_utf8_lossy(&transcript)
         );
     }
 
