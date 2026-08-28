@@ -2285,7 +2285,7 @@ impl TerminalView {
             "up" => {
                 if self.editor_move_v(false, m.shift) {
                     cx.notify();
-                } else {
+                } else if !self.handoff_native_history_key(ks, cx) {
                     self.history_prev(cx);
                 }
                 return;
@@ -2293,7 +2293,7 @@ impl TerminalView {
             "down" => {
                 if self.editor_move_v(true, m.shift) {
                     cx.notify();
-                } else {
+                } else if !self.handoff_native_history_key(ks, cx) {
                     self.history_next(cx);
                 }
                 return;
@@ -4003,6 +4003,22 @@ impl TerminalView {
             self.cmd.set(&stash);
         }
         cx.notify();
+    }
+
+    /// A history file is useful for ghost suggestions and fuzzy search, but it
+    /// cannot reproduce the live shell's order, duplicates, per-session state,
+    /// or custom Up/Down bindings. At the edge of a one-line editor, give the
+    /// draft and arrow to the shell that owns that history. From this point the
+    /// shell owns the rest of the prompt, as it does after any editor handoff.
+    fn handoff_native_history_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        if !self.input_active() || self.cmd.text().contains('\n') {
+            return false;
+        }
+        let Some(bytes) = super::input::keystroke_to_bytes(ks, self.key_flags()) else {
+            return false;
+        };
+        self.handoff_line_to_shell(&bytes, cx);
+        true
     }
 
     fn rerank_history(&mut self, cwd: Option<&std::path::Path>) {
@@ -13443,5 +13459,227 @@ mod gpui_tests {
                 );
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_history_gpui_tests {
+    use super::*;
+    use crate::daemon::protocol::{ClientMsg, DaemonMsg};
+    use crate::daemon::transport::Stream;
+    use gpui::TestAppContext;
+
+    #[cfg(unix)]
+    fn stream_pair() -> (Stream, Stream) {
+        std::os::unix::net::UnixStream::pair().expect("create local test socket pair")
+    }
+
+    #[cfg(windows)]
+    fn stream_pair() -> (Stream, Stream) {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test socket");
+        let addr = listener.local_addr().expect("read loopback test address");
+        let client = TcpStream::connect(addr).expect("connect loopback test socket");
+        let (daemon, _) = listener.accept().expect("accept loopback test socket");
+        (client, daemon)
+    }
+
+    fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, Stream) {
+        crate::core::config::pin_test_config_dir();
+        cx.executor().allow_parking();
+        let (client_side, daemon_side) = stream_pair();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
+                .expect("loopback-backed terminal");
+            TerminalView::with_terminal(terminal, 1, window, cx)
+        });
+        (window, daemon_side)
+    }
+
+    fn prompt_ready(
+        window: &gpui::WindowHandle<TerminalView>,
+        cx: &mut TestAppContext,
+        daemon: &mut Stream,
+    ) {
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(daemon)
+        .expect("send prompt report");
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if window
+                .update(cx, |view, _, _| view.terminal.at_prompt())
+                .expect("read terminal view")
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the prompt report never reached the view");
+    }
+
+    fn next_input(daemon: &mut Stream) -> Vec<u8> {
+        loop {
+            match ClientMsg::read(daemon).expect("client socket stays open") {
+                ClientMsg::Input(bytes) => return bytes,
+                _ => continue,
+            }
+        }
+    }
+
+    fn key(spec: &str) -> gpui::Keystroke {
+        gpui::Keystroke::parse(spec).expect("valid keystroke spec")
+    }
+
+    #[gpui::test]
+    fn cmd_up_hands_the_line_to_cmd_for_native_history(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+
+        window
+            .update(cx, |view, window, cx| {
+                view.shell_spec = Some(ShellSpec {
+                    program: r"C:\Windows\System32\cmd.exe".into(),
+                    args: Vec::new(),
+                    args_are_tty7_defaults: false,
+                });
+                view.history = vec!["git status".into()];
+                view.cmd.set(".venv\\");
+
+                let up = KeyDownEvent {
+                    keystroke: key("up"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&up, window, cx);
+
+                assert!(
+                    view.cmd.is_empty(),
+                    "the draft is handed to cmd before its native history key"
+                );
+            })
+            .expect("send Up to the terminal view");
+
+        assert_eq!(
+            next_input(&mut daemon),
+            b".venv\\".to_vec(),
+            "the visible draft reaches cmd's line editor"
+        );
+        assert_eq!(
+            next_input(&mut daemon),
+            b"\x1b[A".to_vec(),
+            "cmd receives Up and can replay its DOSKEY history"
+        );
+    }
+
+    #[gpui::test]
+    fn posix_up_hands_the_line_to_the_shell_for_native_history(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+
+        window
+            .update(cx, |view, window, cx| {
+                view.shell_spec = Some(ShellSpec {
+                    program: "/bin/zsh".into(),
+                    args: Vec::new(),
+                    args_are_tty7_defaults: false,
+                });
+                view.history = vec!["a command from another shell".into()];
+                view.cmd.set("git st");
+
+                let up = KeyDownEvent {
+                    keystroke: key("up"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&up, window, cx);
+
+                assert!(view.cmd.is_empty(), "the one-line draft was handed off");
+                assert!(
+                    view.editor_handoff.is_some(),
+                    "zsh owns history after the first Up"
+                );
+            })
+            .expect("send Up to the POSIX shell view");
+
+        assert_eq!(next_input(&mut daemon), b"git st".to_vec());
+        assert_eq!(next_input(&mut daemon), b"\x1b[A".to_vec());
+    }
+
+    #[gpui::test]
+    fn restored_pane_without_shell_identity_still_uses_native_history(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+
+        window
+            .update(cx, |view, window, cx| {
+                view.shell_spec = None;
+                view.title = "restored remote pane".into();
+                view.history = vec!["git status".into()];
+                view.cmd.set(".venv\\");
+
+                let up = KeyDownEvent {
+                    keystroke: key("up"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&up, window, cx);
+
+                assert!(view.cmd.is_empty(), "the restored cmd pane handed off");
+            })
+            .expect("send Up to the restored cmd view");
+
+        assert_eq!(next_input(&mut daemon), b".venv\\".to_vec());
+        assert_eq!(next_input(&mut daemon), b"\x1b[A".to_vec());
+    }
+
+    #[gpui::test]
+    fn powershell_up_and_down_stay_with_psreadline_after_handoff(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+
+        window
+            .update(cx, |view, window, cx| {
+                view.shell_spec = Some(ShellSpec {
+                    program: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+                    args: Vec::new(),
+                    args_are_tty7_defaults: false,
+                });
+                view.history = vec!["git status".into()];
+                view.cmd.set(".venv\\");
+
+                let up = KeyDownEvent {
+                    keystroke: key("up"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&up, window, cx);
+
+                assert!(view.cmd.is_empty(), "the PowerShell draft was handed off");
+                assert!(
+                    view.editor_handoff.is_some(),
+                    "PSReadLine owns history after the first Up"
+                );
+
+                let down = KeyDownEvent {
+                    keystroke: key("down"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                view.on_key_down(&down, window, cx);
+            })
+            .expect("send Up to the PowerShell view");
+
+        assert_eq!(next_input(&mut daemon), b".venv\\".to_vec());
+        assert_eq!(next_input(&mut daemon), b"\x1b[A".to_vec());
+        assert_eq!(next_input(&mut daemon), b"\x1b[B".to_vec());
     }
 }
