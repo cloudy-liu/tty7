@@ -1374,12 +1374,17 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The bootstrap `sh` runs inside the distro. `$SHELL` is the only place the
-/// user's real shell is named, so every arm dispatches on it: bash re-execs
-/// through the rcfile written on the Windows side, zsh points `ZDOTDIR` at the
-/// redirectors written beside it, fish carries its integration inline the way
-/// `remote::bootstrap_command` does over SSH, and anything else falls back to a
-/// plain login shell.
+/// The bootstrap `sh` runs inside the distro. Current WSL releases initialize
+/// `$SHELL` from the account database, but releases affected by
+/// microsoft/WSL#10718 instead named the program passed after `--exec`. The
+/// account database is the stable source in both cases and matches the shell a
+/// bare `wsl.exe` starts.
+/// Resolve the current account through NSS, fall back to `/etc/passwd` when
+/// `getent` is unavailable, then use the inherited value only if neither lookup
+/// answers. Bash re-execs through the rcfile written on the Windows side, zsh
+/// points `ZDOTDIR` at the redirectors written beside it, fish carries its
+/// integration inline the way `remote::bootstrap_command` does over SSH, and
+/// anything else falls back to a plain login shell.
 ///
 /// Both file-backed arms ask whether what they were handed is really there
 /// before trusting it. The files live on the Windows side and reach the distro
@@ -1398,18 +1403,33 @@ fn shell_quote(s: &str) -> String {
 /// `remote::fish_bootstrap` has to quote it the way fish reads quotes.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn wsl_exec_script() -> String {
+    wsl_exec_script_with_passwd("/etc/passwd")
+}
+
+fn wsl_exec_script_with_passwd(passwd_file: &str) -> String {
     format!(
         concat!(
-            r#"case "${{SHELL:-}}" in "#,
-            r#"*/bash) [ -r "${{TTY7_RC:-}}" ] && exec "$SHELL" --rcfile "$TTY7_RC" -i; "#,
-            r#"exec "$SHELL" -l ;; "#,
+            r#"__tty7_shell=; __tty7_uid=$(id -u 2>/dev/null); "#,
+            r#"if [ -n "$__tty7_uid" ] && command -v getent >/dev/null 2>&1; then "#,
+            r#"__tty7_record=$(getent passwd "$__tty7_uid" 2>/dev/null); "#,
+            r#"case "$__tty7_record" in *:*) __tty7_shell=${{__tty7_record##*:}} ;; esac; fi; "#,
+            r#"if [ -z "$__tty7_shell" ] && [ -n "$__tty7_uid" ] && [ -r {passwd} ]; then "#,
+            r#"while IFS=: read -r __tty7_name __tty7_password __tty7_id __tty7_group "#,
+            r#"__tty7_gecos __tty7_home __tty7_candidate; do "#,
+            r#"[ "$__tty7_id" = "$__tty7_uid" ] && __tty7_shell=$__tty7_candidate && break; "#,
+            r#"done < {passwd}; fi; "#,
+            r#"[ -n "$__tty7_shell" ] || __tty7_shell=${{SHELL:-/bin/sh}}; "#,
+            r#"case "$__tty7_shell" in "#,
+            r#"*/bash) [ -r "${{TTY7_RC:-}}" ] && exec "$__tty7_shell" --rcfile "$TTY7_RC" -i; "#,
+            r#"exec "$__tty7_shell" -l ;; "#,
             r#"*/zsh) [ -n "${{TTY7_ZDOTDIR:-}}" ] && [ -r "$TTY7_ZDOTDIR/.zshrc" ] "#,
-            r#"&& export ZDOTDIR="$TTY7_ZDOTDIR"; exec "$SHELL" -l ;; "#,
-            r#"*/fish) exec "$SHELL" -C {} -l ;; "#,
-            r#"*) exec "${{SHELL:-/bin/sh}}" -l ;; "#,
+            r#"&& export ZDOTDIR="$TTY7_ZDOTDIR"; exec "$__tty7_shell" -l ;; "#,
+            r#"*/fish) exec "$__tty7_shell" -C {fish} -l ;; "#,
+            r#"*) exec "$__tty7_shell" -l ;; "#,
             "esac"
         ),
-        shell_quote(FISH_INTEGRATION)
+        passwd = shell_quote(passwd_file),
+        fish = shell_quote(FISH_INTEGRATION)
     )
 }
 
@@ -2440,7 +2460,8 @@ mod tests {
         );
         assert_eq!(inj.args[sep + 1], "sh");
         assert_eq!(inj.args[sep + 2], "-c");
-        assert!(inj.args[sep + 3].contains("$SHELL"));
+        assert!(inj.args[sep + 3].contains("getent passwd"));
+        assert!(inj.args[sep + 3].contains("$__tty7_shell"));
         assert!(inj.args[sep + 3].contains("--rcfile"));
         assert!(inj.replaces_argv);
     }
@@ -2450,10 +2471,10 @@ mod tests {
         let script = wsl_exec_script();
 
         assert!(script.contains(
-            r#"*/bash) [ -r "${TTY7_RC:-}" ] && exec "$SHELL" --rcfile "$TTY7_RC" -i; exec "$SHELL" -l ;;"#
+            r#"*/bash) [ -r "${TTY7_RC:-}" ] && exec "$__tty7_shell" --rcfile "$TTY7_RC" -i; exec "$__tty7_shell" -l ;;"#
         ));
         assert!(script.contains(&format!(
-            r#"*/fish) exec "$SHELL" -C {} -l ;;"#,
+            r#"*/fish) exec "$__tty7_shell" -C {} -l ;;"#,
             shell_quote(FISH_INTEGRATION)
         )));
 
@@ -2472,7 +2493,9 @@ mod tests {
             script
                 .contains(r#"*/zsh) [ -n "${TTY7_ZDOTDIR:-}" ] && [ -r "$TTY7_ZDOTDIR/.zshrc" ] "#)
         );
-        assert!(script.contains(r#"&& export ZDOTDIR="$TTY7_ZDOTDIR"; exec "$SHELL" -l ;;"#));
+        assert!(
+            script.contains(r#"&& export ZDOTDIR="$TTY7_ZDOTDIR"; exec "$__tty7_shell" -l ;;"#)
+        );
 
         // The redirectors read this to find the user's own startup files, and
         // only the distro can answer it. Naming it out here would aim them at a
@@ -2512,12 +2535,12 @@ mod tests {
     /// which one it picks, with stub shells standing in for the distro's.
     #[cfg(unix)]
     #[test]
-    fn the_wsl_bootstrap_picks_the_arm_that_matches_the_distro_s_shell() {
+    fn the_wsl_bootstrap_dispatches_on_the_current_account_shell() {
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Command;
 
         let dir = throwaway_dir("tty7-wslarm-").expect("temp dir");
-        for name in ["bash", "zsh", "fish"] {
+        for name in ["bash", "zsh", "fish", "fallback"] {
             let stub = dir.join(name);
             std::fs::write(
                 &stub,
@@ -2526,6 +2549,20 @@ mod tests {
             .unwrap();
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let id = dir.join("id");
+        std::fs::write(&id, "#!/bin/sh\nprintf '%s\\n' \"$TTY7_TEST_UID\"\n").unwrap();
+        std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let getent = dir.join("getent");
+        std::fs::write(
+            &getent,
+            r#"#!/bin/sh
+[ "$1" = passwd ] && [ "$2" = "$TTY7_TEST_UID" ] || exit 2
+[ "${TTY7_TEST_GETENT_FAIL:-0}" = 0 ] || exit 1
+printf 'user:x:%s:7::/home/user:%s\n' "$TTY7_TEST_UID" "$TTY7_TEST_LOGIN_SHELL"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&getent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let zdotdir = dir.join("zdot");
         std::fs::create_dir_all(&zdotdir).unwrap();
         std::fs::write(zdotdir.join(".zshrc"), "").unwrap();
@@ -2533,12 +2570,24 @@ mod tests {
         let rcfile = dir.join("bashrc");
         std::fs::write(&rcfile, "").unwrap();
 
-        let run = |shell: &str, rc: &str, zdot: &str| {
-            let out = Command::new("sh")
+        let run = |script: String,
+                   account_shell: &str,
+                   inherited_shell: &str,
+                   getent_fails: bool,
+                   rc: &str,
+                   zdot: &str| {
+            let out = Command::new("/bin/sh")
                 .arg("-c")
-                .arg(wsl_exec_script())
+                .arg(script)
                 .env_clear()
-                .env("SHELL", dir.join(shell).to_string_lossy().into_owned())
+                .env("PATH", &dir)
+                .env("SHELL", inherited_shell)
+                .env("TTY7_TEST_UID", "4242")
+                .env("TTY7_TEST_LOGIN_SHELL", account_shell)
+                .env(
+                    "TTY7_TEST_GETENT_FAIL",
+                    if getent_fails { "1" } else { "0" },
+                )
                 .env("TTY7_RC", rc)
                 .env("TTY7_ZDOTDIR", zdot)
                 .output()
@@ -2549,10 +2598,23 @@ mod tests {
 
         let rc = rcfile.to_string_lossy().into_owned();
         let zdot = zdotdir.to_string_lossy().into_owned();
-        assert!(run("bash", &rc, &zdot).contains("bash --rcfile"));
-        assert!(run("fish", &rc, &zdot).starts_with("fish -C"));
+        let inherited = dir.join("fallback").to_string_lossy().into_owned();
+        let account = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let from_nss = |name: &str, rc: &str, zdot: &str| {
+            run(
+                wsl_exec_script(),
+                &account(name),
+                &inherited,
+                false,
+                rc,
+                zdot,
+            )
+        };
 
-        let zsh = run("zsh", &rc, &zdot);
+        assert!(from_nss("bash", &rc, &zdot).contains("bash --rcfile"));
+        assert!(from_nss("fish", &rc, &zdot).starts_with("fish -C"));
+
+        let zsh = from_nss("zsh", &rc, &zdot);
         assert!(zsh.contains("zsh -l"), "{zsh}");
         assert!(zsh.contains(&format!("ZDOTDIR={zdot}")), "{zsh}");
 
@@ -2561,16 +2623,45 @@ mod tests {
         // files rather than to one holding a path that is not there.
         let missing = dir.join("not-there").to_string_lossy().into_owned();
 
-        let blind_zsh = run("zsh", &rc, &missing);
+        let blind_zsh = from_nss("zsh", &rc, &missing);
         assert!(blind_zsh.contains("zsh -l"), "{blind_zsh}");
         assert!(blind_zsh.contains("ZDOTDIR=unset"), "{blind_zsh}");
 
-        let blind_bash = run("bash", &missing, &zdot);
+        let blind_bash = from_nss("bash", &missing, &zdot);
         assert!(
             !blind_bash.contains("--rcfile"),
             "bash was handed an rcfile it cannot read: {blind_bash}"
         );
         assert!(blind_bash.contains("bash -l"), "{blind_bash}");
+
+        let passwd = dir.join("passwd");
+        std::fs::write(
+            &passwd,
+            format!("user:x:4242:7::/home/user:{}\n", account("fish")),
+        )
+        .unwrap();
+        let from_passwd = run(
+            wsl_exec_script_with_passwd(&passwd.to_string_lossy()),
+            &account("bash"),
+            &inherited,
+            true,
+            &rc,
+            &zdot,
+        );
+        assert!(from_passwd.starts_with("fish -C"), "{from_passwd}");
+
+        let from_environment = run(
+            wsl_exec_script_with_passwd(&missing),
+            &account("bash"),
+            &inherited,
+            true,
+            &rc,
+            &zdot,
+        );
+        assert!(
+            from_environment.contains("fallback -l"),
+            "{from_environment}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
