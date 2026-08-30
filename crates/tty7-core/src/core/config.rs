@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -210,8 +210,19 @@ pub struct Config {
     /// stands for the Scratch group. A group without an entry keeps the name
     /// derived from its path, and an entry is removed (not blanked) when the
     /// user commits an empty rename, so the derived name comes back.
+    ///
+    /// Slated for removal. A sidebar group has no identity to hang a name on
+    /// — it is recomputed every frame from a leaf's cwd — so its path is the
+    /// only key available, and moving or renaming that root orphans the entry
+    /// with nothing to collect it. #756 gives the project a real `Project`
+    /// entity that carries its own name; these entries migrate onto it and
+    /// this field goes away.
+    ///
+    /// A `BTreeMap` rather than the `HashMap`s around it: the hashed order is
+    /// per-process, so it would rewrite the whole map's key order in the
+    /// config file on every save once there is more than one entry.
     #[serde(default)]
-    pub sidebar_group_names: HashMap<String, String>,
+    pub sidebar_group_names: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "de_lenient")]
     pub notify_on_command_finish: NotifyMode,
     pub check_for_updates: bool,
@@ -611,7 +622,7 @@ impl Default for Config {
             scm_graph_expanded: false,
             sidebar_grouping: SidebarGrouping::Repo,
             sidebar_diff_preview: true,
-            sidebar_group_names: HashMap::new(),
+            sidebar_group_names: BTreeMap::new(),
             notify_on_command_finish: NotifyMode::Unfocused,
             check_for_updates: true,
             update_channel: UpdateChannel::default(),
@@ -1319,6 +1330,13 @@ mod tests {
         assert!(
             text.contains(r#""D:\\gh-prj\\tty7":"mine""#),
             "the backslashes are escaped, not dropped: {text}"
+        );
+        // The map is ordered, so the file keeps the same key order on every
+        // save. A hashed map orders by a per-process seed instead, which
+        // rewrites this whole object the next time the config is written.
+        assert!(
+            text.contains(r#""sidebar_group_names":{"":"inbox","D:\\gh-prj\\tty7":"mine"}"#),
+            "the keys serialize in sorted order, not hash order: {text}"
         );
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(
