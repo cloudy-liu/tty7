@@ -129,6 +129,14 @@ pub struct Config {
     /// the chrome was drawn at, so an existing config renders unchanged.
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
+    /// The face the chrome is drawn in; `None` is the system UI font.
+    ///
+    /// Only the chrome — the terminal grid keeps `font_family`. The
+    /// struct-level `serde(default)` fills it in for a config written before
+    /// the setting existed, and like every other optional key it is written
+    /// out as `null` rather than dropped, so the file still lists what can be
+    /// set by hand.
+    pub ui_font_family: Option<String>,
     pub theme: String,
     pub theme_preset: String,
     pub theme_follow_system: bool,
@@ -588,6 +596,7 @@ impl Default for Config {
             font_size: 15.0,
             line_height: 1.4,
             ui_font_size: default_ui_font_size(),
+            ui_font_family: None,
             theme: "light".to_string(),
             theme_preset: "light".to_string(),
             theme_follow_system: false,
@@ -775,6 +784,11 @@ impl Config {
         // shrink one label — it makes the window unusable. Keep the range to
         // sizes the layout still holds together at.
         self.ui_font_size = self.ui_font_size.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX);
+        if let Some(family) = &self.ui_font_family
+            && family.trim().is_empty()
+        {
+            self.ui_font_family = None;
+        }
         self.scrollback_limit = self.scrollback_limit.clamp(100, MAX_SCROLLBACK);
         if !self.mouse_scroll_multiplier.is_finite() || self.mouse_scroll_multiplier <= 0.0 {
             self.mouse_scroll_multiplier = Config::default().mouse_scroll_multiplier;
@@ -1562,6 +1576,20 @@ mod tests {
         // point: `50 + 1` and `3.0 - 0.05` are legal, so neither click can be
         // turned around by a clamp.
         assert!(50.0 + 1.0 <= FONT_SIZE_MAX && 3.0 - 0.05 >= LINE_HEIGHT_MIN);
+    }
+
+    #[test]
+    fn ui_font_family_defaults_to_none_and_sanitizes_blank_to_none() {
+        let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert_eq!(cfg.ui_font_family, None);
+
+        let mut cfg: Config = serde_json::from_str(r#"{"ui_font_family": "  "}"#).unwrap();
+        cfg.sanitize();
+        assert_eq!(cfg.ui_font_family, None);
+
+        let mut cfg: Config = serde_json::from_str(r#"{"ui_font_family": "Inter"}"#).unwrap();
+        cfg.sanitize();
+        assert_eq!(cfg.ui_font_family, Some("Inter".to_string()));
     }
 
     #[test]
