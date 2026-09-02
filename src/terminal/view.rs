@@ -2593,8 +2593,10 @@ impl TerminalView {
     }
 
     pub(super) fn key_flags(&self) -> super::input::KeyFlags {
+        let win32_input = self.terminal.win32_input_mode()
+            && self.agent() == Some(crate::core::cli_agent::CLIAgent::Codex);
         super::input::KeyFlags::from_mode(self.terminal.term.lock().mode())
-            .with_win32_input(self.terminal.win32_input_mode())
+            .with_win32_input(win32_input)
     }
 
     fn tab_bytes(&self, shift: bool) -> Vec<u8> {
@@ -8874,6 +8876,30 @@ mod gpui_tests {
         panic!("the alternate-screen switch never reached the grid");
     }
 
+    fn foreground_agent_and_win32_ready(
+        window: &gpui::WindowHandle<TerminalView>,
+        cx: &mut TestAppContext,
+        daemon: &mut UnixStream,
+        agent: crate::core::cli_agent::CLIAgent,
+        output: &[u8],
+    ) {
+        DaemonMsg::Agent(Some(agent)).encode(daemon).unwrap();
+        DaemonMsg::Output(output.to_vec()).encode(daemon).unwrap();
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if window
+                .update(cx, |view, _, _| {
+                    view.agent() == Some(agent) && view.terminal.win32_input_mode()
+                })
+                .unwrap()
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the foreground agent and win32-input-mode did not reach the view");
+    }
+
     #[gpui::test]
     fn an_agent_that_has_finished_its_turn_is_not_busy(cx: &mut TestAppContext) {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
@@ -10655,12 +10681,45 @@ mod gpui_tests {
     }
 
     #[gpui::test]
-    fn shift_enter_reaches_a_foreground_tui_as_lf_without_kitty(cx: &mut TestAppContext) {
+    fn claude_shift_enter_keeps_lf_after_conpty_handshake(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness(cx);
         cx.update(|cx| crate::ui::keymap::init(cx));
+        foreground_agent_and_win32_ready(
+            &window,
+            cx,
+            &mut daemon,
+            crate::core::cli_agent::CLIAgent::Claude,
+            b"\x1b[?9001h\x1b[?9001l\x1b[?9001h",
+        );
         window
             .update(cx, |view, window, cx| {
+                assert!(view.terminal.win32_input_mode());
+                assert!(!view.key_flags().win32_input());
+                assert!(!view.input_active(), "the foreground TUI owns input");
+                window.activate_window();
+                view.focus_handle.focus(window, cx);
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_keystrokes("shift-enter");
+
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\n".to_vec()));
+    }
+
+    fn assert_foreground_agent_shift_enter_is_lf(
+        cx: &mut TestAppContext,
+        agent: crate::core::cli_agent::CLIAgent,
+    ) {
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        cx.update(|cx| crate::ui::keymap::init(cx));
+        foreground_agent_and_win32_ready(&window, cx, &mut daemon, agent, b"\x1b[?9001h");
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.terminal.win32_input_mode());
+                assert!(!view.key_flags().win32_input());
                 assert!(!view.input_active(), "the foreground TUI owns input");
                 window.activate_window();
                 view.focus_handle.focus(window, cx);
@@ -10674,7 +10733,20 @@ mod gpui_tests {
     }
 
     #[gpui::test]
-    fn shift_enter_reaches_a_foreground_tui_as_win32_after_9001h(cx: &mut TestAppContext) {
+    fn cursor_shift_enter_keeps_lf_after_conpty_handshake(cx: &mut TestAppContext) {
+        assert_foreground_agent_shift_enter_is_lf(cx, crate::core::cli_agent::CLIAgent::Cursor);
+    }
+
+    #[gpui::test]
+    fn antigravity_shift_enter_keeps_lf_after_conpty_handshake(cx: &mut TestAppContext) {
+        assert_foreground_agent_shift_enter_is_lf(
+            cx,
+            crate::core::cli_agent::CLIAgent::Antigravity,
+        );
+    }
+
+    #[gpui::test]
+    fn unknown_foreground_tui_keeps_lf_after_conpty_handshake(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness(cx);
         cx.update(|cx| crate::ui::keymap::init(cx));
@@ -10684,13 +10756,42 @@ mod gpui_tests {
         for _ in 0..200 {
             cx.run_until_parked();
             if window
-                .update(cx, |view, _, _| view.key_flags().win32_input())
+                .update(cx, |view, _, _| view.terminal.win32_input_mode())
                 .unwrap()
             {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.agent(), None);
+                assert!(view.terminal.win32_input_mode());
+                assert!(!view.key_flags().win32_input());
+                assert!(!view.input_active(), "the foreground TUI owns input");
+                window.activate_window();
+                view.focus_handle.focus(window, cx);
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_keystrokes("shift-enter");
+
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\n".to_vec()));
+    }
+
+    #[gpui::test]
+    fn codex_shift_enter_uses_win32_after_9001h(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        cx.update(|cx| crate::ui::keymap::init(cx));
+        foreground_agent_and_win32_ready(
+            &window,
+            cx,
+            &mut daemon,
+            crate::core::cli_agent::CLIAgent::Codex,
+            b"\x1b[?9001h",
+        );
         window
             .update(cx, |view, window, cx| {
                 assert!(
@@ -10713,19 +10814,21 @@ mod gpui_tests {
     }
 
     #[gpui::test]
-    fn kitty_keyboard_beats_win32_input_mode_for_shift_enter(cx: &mut TestAppContext) {
+    fn claude_kitty_keyboard_beats_win32_input_mode_for_shift_enter(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
         let (window, mut daemon) = harness(cx);
         cx.update(|cx| crate::ui::keymap::init(cx));
-        DaemonMsg::Output(b"\x1b[?9001h\x1b[>1u".to_vec())
-            .encode(&mut daemon)
-            .unwrap();
+        foreground_agent_and_win32_ready(
+            &window,
+            cx,
+            &mut daemon,
+            crate::core::cli_agent::CLIAgent::Claude,
+            b"\x1b[?9001h\x1b[>1u",
+        );
         for _ in 0..200 {
             cx.run_until_parked();
             if window
-                .update(cx, |view, _, _| {
-                    view.key_flags().kitty_active() && view.key_flags().win32_input()
-                })
+                .update(cx, |view, _, _| view.key_flags().kitty_active())
                 .unwrap()
             {
                 break;
@@ -10735,7 +10838,8 @@ mod gpui_tests {
         window
             .update(cx, |view, window, cx| {
                 assert!(view.key_flags().kitty_active());
-                assert!(view.key_flags().win32_input());
+                assert!(view.terminal.win32_input_mode());
+                assert!(!view.key_flags().win32_input());
                 assert!(!view.input_active(), "the foreground TUI owns input");
                 window.activate_window();
                 view.focus_handle.focus(window, cx);
