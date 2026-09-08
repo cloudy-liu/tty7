@@ -55,6 +55,7 @@ Code 等 coding agent 的状态感知放在同一个应用里。
 | 通过 Windows 进程树识别 coding agent | Windows | 未提交上游 |
 | ConPTY win32-input-mode 下的 Shift+Enter | Windows | 未提交上游 |
 | pane 内 `ssh` 跳转识别 | Windows | [上游已关闭](https://github.com/l0ng-ai/tty7/pull/739) |
+| pane 内 SSH 的 Vim 命令行光标位置 | Windows | 未提交上游 |
 | WSL 账号登录 shell 解析 | Windows · WSL | 未提交上游 |
 | 提示符文本可选择与 Windows 路径智能选择 | 全平台 | 未提交上游 |
 | 用于搜索和建议的原生 shell 历史 | 全平台 | 未提交上游 |
@@ -102,6 +103,10 @@ Code 等 coding agent 的状态感知放在同一个应用里。
   影响的 WSL 版本把 `wsl.exe --exec sh` 的 bootstrap 当作用户 shell 启动。
 - 在 Windows 上通过遍历进程树并读取参数，识别在 pane 内启动的 `ssh` 会话，
   随后取消该 pane 的本地 Git 侧边栏分组，并在远程上下文就绪后刷新侧边栏。
+- 修复 Windows pane 内直接运行 `ssh` 时，Vim 的 `:wq` 回显落到文件行的问题，
+  见 [l0ng-ai/tty7#774](https://github.com/l0ng-ai/tty7/issues/774)。移除 ConPTY
+  防闪烁补偿中改写光标位置的处理。上游此前已通过
+  [l0ng-ai/tty7#442](https://github.com/l0ng-ai/tty7/pull/442) 在 macOS/Linux 禁用它。
 
 ### 侧边栏与 agent
 

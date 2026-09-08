@@ -328,8 +328,7 @@ pub enum TurnCut {
 }
 
 /// Byte scanner over the pty stream, reporting the agent events an outline
-/// cares about, in ascending offset order — the same shape (and the same
-/// contract) as [`ParkedCursorScanner`](crate::terminal::parked_cursor::ParkedCursorScanner).
+/// cares about, in ascending order of the offsets immediately after each event.
 pub struct AgentTurnScanner {
     tok: OscTokenizer,
 }

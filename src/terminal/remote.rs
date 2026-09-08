@@ -13,7 +13,6 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
 use crate::terminal::agent_marks::{AgentTurnScanner, AgentTurns, TurnCut};
-use crate::terminal::parked_cursor::{CursorCut, ParkedCursorRepair, ParkedCursorScanner};
 
 use std::collections::VecDeque;
 
@@ -62,16 +61,6 @@ struct ShellState {
     last_exit: Option<i32>,
     seq: u64,
     cycle: u64,
-}
-
-/// A point in a batch of pty output where the emulator has to stop, because
-/// something wants to read the state the sequence there left behind — the cell
-/// a repaint hid the cursor on, or the row an agent turn began at. Both are
-/// positions, and a position is only knowable by parsing up to it and no
-/// further.
-enum Cut {
-    Cursor(CursorCut),
-    Turn(TurnCut),
 }
 
 struct ReaderSignals {
@@ -989,17 +978,6 @@ impl RemoteTerminal {
         term.set_options(terminal_config_from_user(user_config));
     }
 
-    /// Whether this build puts back the cursor a repaint parked — see
-    /// [`crate::terminal::parked_cursor`].
-    ///
-    /// Only conhost parks one, so like `conpty_resize` the repair is Windows'
-    /// alone. On a raw pty the application owns the cursor and is free to end a
-    /// repaint on the text it just wrote and then echo the next keystroke
-    /// straight after it, with no positioning of its own: vim opens its command
-    /// line that way, and putting the cursor back on the cell the repaint hid it
-    /// on drops the `wq!` typed next onto the row being edited (#430).
-    const REPAIR_PARKED_CURSOR: bool = cfg!(windows);
-
     fn spawn_reader(
         term: Arc<FairMutex<Term<EventProxy>>>,
         proxy: EventProxy,
@@ -1034,8 +1012,6 @@ impl RemoteTerminal {
                 let mut osc = OscNotifyScanner::default();
                 let mut mode_tok = OscTokenizer::new(&[b"133"]);
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
-                let mut cursor_scan = ParkedCursorScanner::new();
-                let mut parked_cursor = ParkedCursorRepair::default();
                 let mut turn_scan = AgentTurnScanner::new();
                 let mut win32_scan = crate::terminal::win32_input::Win32InputModeScanner::new();
                 let mut pending: Vec<u8> = buffered;
@@ -1088,26 +1064,12 @@ impl RemoteTerminal {
                     macro_rules! flush_batch {
                         () => {
                             if !out_batch.is_empty() {
-                                // Each scanner reports an offset one past the
-                                // sequence it matched, in ascending order, so the
-                                // batch splits at each of them: advance the
-                                // emulator to the cut, act on the state that
-                                // sequence left behind, carry on.
-                                let mut cuts: Vec<(usize, Cut)> = Vec::new();
-                                if Self::REPAIR_PARKED_CURSOR {
-                                    cursor_scan
-                                        .feed(&out_batch, |off, c| cuts.push((off, Cut::Cursor(c))));
-                                }
-                                // Two ascending runs concatenated are not one
-                                // ascending run, and a cut out of order would
-                                // advance the emulator backwards — but only a
-                                // batch carrying both kinds pays for the sort,
-                                // and agent events are a handful per turn.
-                                let cursor_cuts = cuts.len();
-                                turn_scan.feed(&out_batch, |off, c| cuts.push((off, Cut::Turn(c))));
-                                if cursor_cuts > 0 && cuts.len() > cursor_cuts {
-                                    cuts.sort_by_key(|(off, _)| *off);
-                                }
+                                // Only agent markers split parsing. Hide/show sequences
+                                // must leave the VT cursor untouched: Vim echoes the next
+                                // key at the position a repaint leaves, even through
+                                // ConPTY (l0ng-ai/tty7#430, l0ng-ai/tty7#774).
+                                let mut cuts: Vec<(usize, TurnCut)> = Vec::new();
+                                turn_scan.feed(&out_batch, |off, cut| cuts.push((off, cut)));
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
                                     let mut term = term.lock();
@@ -1122,10 +1084,7 @@ impl RemoteTerminal {
                                         for (off, cut) in cuts {
                                             processor.advance(&mut *term, &out_batch[at..off]);
                                             at = off;
-                                            match cut {
-                                                Cut::Cursor(c) => parked_cursor.apply(&mut term, c),
-                                                Cut::Turn(t) => turns.apply(&term, t),
-                                            }
+                                            turns.apply(&term, cut);
                                         }
                                         processor.advance(&mut *term, &out_batch[at..]);
                                     }
@@ -1245,8 +1204,6 @@ impl RemoteTerminal {
                             }
                             DaemonMsg::Snapshot(bytes) => {
                                 flush_batch!();
-                                cursor_scan.reset();
-                                parked_cursor.reset();
                                 turn_scan.reset();
                                 // Parse state only — the latch is sticky, because
                                 // a later snapshot often omits the 9001 handshake.
@@ -2808,6 +2765,170 @@ fn win_size(size: TermSize, cell_w: u16, cell_h: u16) -> WinSize {
     }
 }
 
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn socket_pair() -> (Stream, Stream) {
+        std::os::unix::net::UnixStream::pair().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn socket_pair() -> (Stream, Stream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (daemon, _) = listener.accept().unwrap();
+        (client, daemon)
+    }
+
+    /// Feeds one conhost-shaped repaint and reports the cell the cursor ends on,
+    /// waiting for the `X` the frame paints so the reader is known to be done.
+    fn cursor_after_conpty_frame(frame: &[u8]) -> (i32, usize) {
+        use std::io::Write as _;
+
+        crate::core::config::pin_test_config_dir();
+        let (client_side, mut daemon_side) = socket_pair();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+
+        // Where the TUI put the cursor before conhost repainted over it.
+        DaemonMsg::Output(b"\x1b[6;4H".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        DaemonMsg::Output(frame.to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+
+        for _ in 0..600 {
+            {
+                let t = term.term.lock();
+                let painted = t.grid()[alacritty_terminal::index::Line(19)]
+                    [alacritty_terminal::index::Column(1)]
+                .c;
+                if painted == 'X' {
+                    let point = t.grid().cursor.point;
+                    return (point.line.0, point.column.0);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the reader never applied the frame");
+    }
+
+    #[test]
+    fn a_conpty_frame_keeps_the_cursor_where_the_erase_left_it() {
+        assert_eq!(
+            cursor_after_conpty_frame(
+                b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[?25h"
+            ),
+            (21, 41),
+            "showing the cursor must not change where the next byte lands"
+        );
+    }
+
+    #[test]
+    fn a_conpty_frame_that_moves_the_cursor_before_showing_it_is_obeyed() {
+        assert_eq!(
+            cursor_after_conpty_frame(
+                b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[9;9H\x1b[?25h"
+            ),
+            (8, 8),
+            "the frame painted the cursor somewhere on purpose"
+        );
+    }
+
+    fn assert_vim_command_line(stream: &[u8], size: TermSize, expected: &str) {
+        use alacritty_terminal::index::{Column, Line};
+
+        crate::core::config::pin_test_config_dir();
+        for chunk_size in [stream.len(), 1, 7] {
+            let (client_side, mut daemon) = socket_pair();
+            let term = RemoteTerminal::from_stream(client_side, size).unwrap();
+            for chunk in stream.chunks(chunk_size) {
+                DaemonMsg::Output(chunk.to_vec())
+                    .encode(&mut daemon)
+                    .unwrap();
+                // Flush each output frame, even if the socket coalesces them.
+                DaemonMsg::Size(win_size(size, 8, 17))
+                    .encode(&mut daemon)
+                    .unwrap();
+            }
+            DaemonMsg::Output(b"\x1b]2;vim-replay-complete\x07".to_vec())
+                .encode(&mut daemon)
+                .unwrap();
+            let mut done = false;
+            for _ in 0..600 {
+                while let Ok(event) = term.events.try_recv() {
+                    if matches!(event, AlacEvent::Title(title) if title == "vim-replay-complete") {
+                        done = true;
+                    }
+                }
+                if done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(done, "the reader never finished the replay");
+            let t = term.term.lock();
+            let row = |line| {
+                (0..size.cols)
+                    .map(|col| t.grid()[Line(line)][Column(col)].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            };
+            assert_eq!(
+                row(size.rows as i32 - 1),
+                expected,
+                "command echo moved off its row with {chunk_size}-byte output frames"
+            );
+            assert_eq!(row(0), "123456789", "command echo overwrote the file row");
+            assert_eq!(t.grid().cursor.point.line.0, size.rows as i32 - 1);
+            assert_eq!(t.grid().cursor.point.column.0, expected.len());
+        }
+    }
+
+    /// Vim 9 on a raw 20x11 PTY, from l0ng-ai/tty7#430. The command-line
+    /// repaint ends after the colon; later keys have no positioning of their
+    /// own. This must also hold on a Windows client receiving a Unix PTY.
+    #[test]
+    fn a_raw_pty_repaint_keeps_the_cursor_the_frame_left_so_the_echo_lands_on_it() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[1;1H123456789\x1b[1;1H");
+        stream.extend_from_slice(b"\x1b[?25l\x1b[m\x1b[11;10H^[\x1b[1;1H\x1b[?25h");
+        stream.extend_from_slice(b"\x1b[?25l\x1b[11;10H  \x1b[1;1H\x07\x1b[?25h");
+        stream.extend_from_slice(
+            b"\x1b[?25l\x1b[11;10H:\x1b[1;1H\x1b[11;1H\x1b[K\x1b[11;1H:\x1b[?25h",
+        );
+        stream.extend_from_slice(b"wq!");
+        assert_vim_command_line(&stream, TermSize::new(20, 11), ":wq!");
+    }
+
+    /// Minimized from local cmd.exe -> bundled ConPTY -> ssh.exe -> Linux Vim
+    /// 8.1, reproducing l0ng-ai/tty7#774. ConPTY passes this legal repaint
+    /// through too, so choosing a cursor repair by client OS is insufficient.
+    #[test]
+    fn a_local_windows_ssh_vim_repaint_preserves_the_command_line() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(
+            b"\x1b[?1049h\x1b[H\x1b[2J123456789\r\nsecond line\x1b[1;1H\x1b[?25h\x07",
+        );
+        stream.extend_from_slice(b"\x1b[?25l\x1b[m\x1b[24;1H\x1b[K\x1b[24;1H:\x1b[?2004h\x1b[?25h");
+        stream.extend_from_slice(b"wq");
+        assert_vim_command_line(&stream, TermSize::new(80, 24), ":wq");
+    }
+
+    #[test]
+    fn a_repaint_on_the_primary_screen_also_keeps_its_text_position() {
+        assert_vim_command_line(
+            b"123456789\r\x1b[?25l\x1b[11;1H:\x1b[?25hwq!",
+            TermSize::new(20, 11),
+            ":wq!",
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
@@ -4163,135 +4284,6 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, AlacEvent::PtyWrite(_))),
             "a query inside the replayed sync tail must stay suppressed"
-        );
-    }
-
-    /// Feeds one conhost-shaped repaint and reports the cell the cursor ends on,
-    /// waiting for the `X` the frame paints so the reader is known to be done.
-    fn cursor_after_conpty_frame(frame: &[u8]) -> (i32, usize) {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // Where the TUI put the cursor before conhost repainted over it.
-        DaemonMsg::Output(b"\x1b[6;4H".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        DaemonMsg::Output(frame.to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        for _ in 0..600 {
-            {
-                let t = term.term.lock();
-                let painted = t.grid()[alacritty_terminal::index::Line(19)]
-                    [alacritty_terminal::index::Column(1)]
-                .c;
-                if painted == 'X' {
-                    let point = t.grid().cursor.point;
-                    return (point.line.0, point.column.0);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the reader never applied the frame");
-    }
-
-    #[test]
-    fn a_conpty_frame_that_shows_the_cursor_over_an_erase_keeps_the_cell_it_hid_on() {
-        let got = cursor_after_conpty_frame(
-            b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[?25h",
-        );
-        if RemoteTerminal::REPAIR_PARKED_CURSOR {
-            assert_eq!(
-                got,
-                (5, 3),
-                "conhost parked the cursor on the cell it erased last; the cursor \
-                 belongs where it was when the repaint hid it"
-            );
-        } else {
-            assert_eq!(
-                got,
-                (21, 41),
-                "with no conhost in between the stream is the application's own, \
-                 and the cell it left the cursor on is the cell it meant"
-            );
-        }
-    }
-
-    #[test]
-    fn a_conpty_frame_that_moves_the_cursor_before_showing_it_is_obeyed() {
-        assert_eq!(
-            cursor_after_conpty_frame(
-                b"\x1b[?25l\x1b[20;2HX\x1b[K\x1b[m\x1b[22;42H\x1b[K\x1b[9;9H\x1b[?25h"
-            ),
-            (8, 8),
-            "the frame painted the cursor somewhere on purpose"
-        );
-    }
-
-    /// Issue #430. Vim opens its command line with exactly the shape the parked
-    /// -cursor scanner calls parked — hide, move around to paint, end on the `:`
-    /// it wrote — and then echoes every following keystroke as a bare byte at
-    /// wherever that left the cursor. Putting the cursor back on a raw pty
-    /// therefore does not straighten out a stray caret, it drops `wq!` onto the
-    /// row vim was editing. Bytes below are a capture of vim 9 on a 20x11 pty.
-    #[test]
-    fn a_raw_pty_repaint_keeps_the_cursor_the_frame_left_so_the_echo_lands_on_it() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(20, 11)).unwrap();
-
-        let mut stream: Vec<u8> = Vec::new();
-        // `vim test.md`: the alternate screen, the file, cursor home.
-        stream.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[1;1H123456789\x1b[1;1H");
-        // Esc, then `:` — two bracketed repaints, the second ending on the `:`
-        // vim wrote at the head of the command line.
-        stream.extend_from_slice(b"\x1b[?25l\x1b[m\x1b[11;10H^[\x1b[1;1H\x1b[?25h");
-        stream.extend_from_slice(b"\x1b[?25l\x1b[11;10H  \x1b[1;1H\x07\x1b[?25h");
-        stream.extend_from_slice(
-            b"\x1b[?25l\x1b[11;10H:\x1b[1;1H\x1b[11;1H\x1b[K\x1b[11;1H:\x1b[?25h",
-        );
-        // `w`, `q`, `!`: vim echoes them with no positioning of their own.
-        stream.extend_from_slice(b"wq!");
-        DaemonMsg::Output(stream).encode(&mut daemon_side).unwrap();
-        daemon_side.flush().unwrap();
-
-        let row = |t: &Term<EventProxy>, line: i32| -> String {
-            (0..20)
-                .map(|col| {
-                    t.grid()[alacritty_terminal::index::Line(line)]
-                        [alacritty_terminal::index::Column(col)]
-                    .c
-                })
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        };
-
-        // The whole batch is applied under one lock, so the `:` landing on the
-        // command line means every byte after it landed too.
-        let mut command_line = String::new();
-        let mut edited = String::new();
-        for _ in 0..600 {
-            {
-                let t = term.term.lock();
-                command_line = row(&t, 10);
-                edited = row(&t, 0);
-            }
-            if command_line.starts_with(':') {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(
-            command_line, ":wq!",
-            "the keystrokes belong after the `:` the repaint ended on"
-        );
-        assert_eq!(
-            edited, "123456789",
-            "and nothing of them belongs on the row vim was editing"
         );
     }
 

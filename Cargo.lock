@@ -9792,7 +9792,6 @@ dependencies = [
  "libc",
  "log",
  "mac-notification-sys",
- "memchr",
  "notify 8.2.0",
  "notify-rust",
  "objc2 0.6.4",

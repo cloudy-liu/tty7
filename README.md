@@ -58,6 +58,7 @@ column records where each change stands with the upstream project:
 | Coding-agent detection through the Windows process tree | Windows | Not submitted |
 | Shift+Enter under ConPTY win32-input-mode | Windows | Not submitted |
 | In-pane `ssh` hop detection | Windows | [Declined](https://github.com/l0ng-ai/tty7/pull/739) |
+| Vim command-line positioning over in-pane SSH | Windows | Not submitted |
 | WSL account login-shell resolution | Windows · WSL | Not submitted |
 | Selectable prompt text and Windows path smart-selection | All | Not submitted |
 | Native shell history for search and suggestions | All | Not submitted |
@@ -110,6 +111,11 @@ is no longer a difference.
 - Recognizes an `ssh` session started inside a pane on Windows by walking the
   process tree and reading its arguments, then drops local Git sidebar grouping
   for that pane and refreshes the sidebar once the remote context arrives.
+- Keeps Vim's `:wq` echo on its command line when running `ssh` inside a
+  Windows pane, as reported in [l0ng-ai/tty7#774](https://github.com/l0ng-ai/tty7/issues/774).
+  Removes the cursor-position rewrite from the ConPTY flicker workaround.
+  Upstream had already disabled it on macOS and Linux in
+  [l0ng-ai/tty7#442](https://github.com/l0ng-ai/tty7/pull/442).
 
 ### Sidebar and agents
 
