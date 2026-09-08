@@ -155,6 +155,11 @@ Download the newest fork-maintained build from
 Release assets also include `checksums.txt` and the headless `tty7-server`
 binaries used by remote workspaces.
 
+The current maintenance release is `v26.8.3-c.5`: c.4 plus the SSH/Vim
+command-line fix. The broader `v26.9.1-c` release has been withdrawn. If you
+installed it, download and install c.5 manually; the updater does not downgrade.
+See the [c.5 release record](docs/releases/v26.8.3-c.5.md) for the exact changes.
+
 ## Versioning
 
 Custom releases keep the upstream base version and append `-c`:
