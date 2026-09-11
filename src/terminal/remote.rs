@@ -1322,6 +1322,18 @@ impl RemoteTerminal {
                             } => {
                                 flush_batch!();
                                 if let Ok(mut guard) = shell.lock() {
+                                    // The first prompt can precede a queued
+                                    // resume. Only a running command returning
+                                    // to the shell proves that it is over.
+                                    if active && at_prompt && guard.active && !guard.at_prompt {
+                                        if let (Ok(mut agent), Ok(mut session)) =
+                                            (agent.lock(), agent_session.lock())
+                                        {
+                                            *agent = None;
+                                            *session = None;
+                                        }
+                                        proxy.send_event(AlacEvent::Wakeup);
+                                    }
                                     *guard = ShellState {
                                         active,
                                         at_prompt,
@@ -2878,6 +2890,62 @@ mod agent_resume_tests {
             assert!(
                 term.agent_session().unwrap().session_id.is_none(),
                 "{agent:?} must not carry its old id to a different command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_resume_keeps_the_initial_prompt_but_clears_on_return_to_shell() {
+        crate::core::config::pin_test_config_dir();
+        for agent in CLIAgent::ALL {
+            let Some(command) = agent.resume_command("restored", None) else {
+                continue;
+            };
+            let (client, mut daemon) = socket_pair();
+            let term = RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
+            term.seed_resumed_agent(
+                agent,
+                "restored",
+                crate::core::cli_agent::command_argv(&command),
+            );
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt: true,
+                last_exit: None,
+            }
+            .encode(&mut daemon)
+            .unwrap();
+            wait_for(&term, |term| term.prompt_seq() == 1);
+            assert_eq!(
+                term.agent_session().unwrap().session_id.as_deref(),
+                Some("restored"),
+                "the first prompt may arrive before the queued resume runs"
+            );
+
+            // A missing executable returns directly to the shell. No process was
+            // detected, so the daemon need not send an Agent(None) transition.
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt: false,
+                last_exit: None,
+            }
+            .encode(&mut daemon)
+            .unwrap();
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt: true,
+                last_exit: Some(127),
+            }
+            .encode(&mut daemon)
+            .unwrap();
+            wait_for(&term, |term| term.prompt_seq() == 3);
+            assert!(
+                term.foreground_agent().is_none(),
+                "the shell must not retain a fake foreground agent"
+            );
+            assert!(
+                term.agent_session().is_none(),
+                "failed startup must release typeahead and the saved identity"
             );
         }
     }

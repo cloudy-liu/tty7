@@ -738,6 +738,9 @@ struct PaneState {
     agent: Option<crate::core::cli_agent::CLIAgent>,
     agent_argv: Option<Vec<String>>,
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
+    /// Process probes may still see an invocation after its shutdown hook.
+    /// Keep it suppressed until a new command/hook or a different process.
+    ended_agent: Option<(crate::core::cli_agent::CLIAgent, Option<Vec<String>>)>,
     alive: bool,
     exit_code: Option<i32>,
 }
@@ -1071,6 +1074,7 @@ pub struct Carried {
     pub agent: Option<crate::core::cli_agent::CLIAgent>,
     pub agent_argv: Option<Vec<String>>,
     pub agent_session: Option<crate::core::cli_agent::AgentSessionState>,
+    pub ended_agent: Option<(crate::core::cli_agent::CLIAgent, Option<Vec<String>>)>,
 }
 
 /// A pty master this process inherited from its own previous image.
@@ -1445,6 +1449,7 @@ impl DaemonPane {
                 agent: None,
                 agent_session: None,
                 agent_argv: None,
+                ended_agent: None,
                 alive: true,
                 exit_code: None,
             },
@@ -1603,6 +1608,7 @@ impl DaemonPane {
             agent: st.agent,
             agent_argv: st.agent_argv.clone(),
             agent_session: st.agent_session.clone(),
+            ended_agent: st.ended_agent.clone(),
         })
     }
 
@@ -1670,6 +1676,7 @@ impl DaemonPane {
                 agent: carried.agent,
                 agent_session: carried.agent_session,
                 agent_argv: carried.agent_argv,
+                ended_agent: carried.ended_agent,
                 alive: true,
                 exit_code: None,
             },
@@ -1719,6 +1726,7 @@ impl DaemonPane {
             agent: None,
             agent_session: None,
             agent_argv: None,
+            ended_agent: None,
             alive: true,
             exit_code: None,
         }));
@@ -1998,7 +2006,12 @@ impl DaemonPane {
                             let facts_before = may_change_facts.then(|| observed_facts(&st));
                             st.ring.append(bytes);
                             fan_out_output(&mut st, bytes, frames, &gate);
-                            apply_signals(&mut st, signals);
+                            // The probe was taken before parsing these hooks;
+                            // the hook and shell lifecycle must have the last word.
+                            if let Some(agent) = agent {
+                                apply_agent(&mut st, agent);
+                            }
+                            let agent_ended = apply_signals(&mut st, signals);
                             if let Some(remote) = remote {
                                 apply_remote_context(&mut st, remote);
                             }
@@ -2007,9 +2020,6 @@ impl DaemonPane {
                             // must stop us honoring host-local object names. Cheap
                             // and only meaningful when a probe follows.
                             graphics.set_local(st.remote.is_none());
-                            if let Some(agent) = agent {
-                                apply_agent(&mut st, agent);
-                            }
                             apply_probed_cwd(&mut st, probed_cwd);
                             if let Some(tr1) = tr1 {
                                 tr_disp_t += tr1.elapsed();
@@ -2020,9 +2030,9 @@ impl DaemonPane {
                             drop(st);
                             if !shutting_down.load(Ordering::SeqCst)
                                 && let (Some(before), Some(after)) = (facts_before, facts_after)
-                                && facts_changed(&before, &after)
+                                && (facts_changed(&before, &after) || agent_ended)
                             {
-                                let agent_changed = agent_facts_changed(
+                                let agent_changed = agent_ended || agent_facts_changed(
                                     before.agent.as_ref(),
                                     after.agent.as_ref(),
                                 );
@@ -2670,7 +2680,10 @@ fn agent_facts_changed(
     }
 }
 
-fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
+/// Returns whether a hook or a completed shell command ended the agent. Even
+/// if no process ever started, or it started and ended in this same read,
+/// that invalidates a resume seeded only in the machine tree.
+fn apply_signals(st: &mut PaneState, signals: SniffSignals) -> bool {
     if let Some(cwd) = signals.cwd {
         if st.cwd.as_ref() != Some(&cwd) {
             notify(st, DaemonMsg::Cwd(cwd.clone()));
@@ -2682,7 +2695,13 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
         // which parsed the same sequence. This is only for the tree.
         st.osc_title = (!title.is_empty()).then_some(title);
     }
+    let mut command_finished = false;
     for shell in signals.shell {
+        command_finished |=
+            shell.active && shell.at_prompt && st.shell.active && !st.shell.at_prompt;
+        if shell.active && !shell.at_prompt && st.shell.at_prompt {
+            st.ended_agent = None;
+        }
         #[cfg(windows)]
         if shell_mark_capture_changed(&st.shell, &shell) {
             apply_agent(
@@ -2700,7 +2719,33 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
             },
         );
     }
-    apply_agent_signals(st, signals.agent_events, signals.notification);
+    let session_ended = apply_agent_signals(st, signals.agent_events, signals.notification);
+    let command_finished = command_finished && st.shell.at_prompt;
+    if command_finished {
+        let had_session = st.agent_session.is_some();
+        end_agent(st);
+        if had_session {
+            notify(st, DaemonMsg::AgentStatus(None));
+        }
+    }
+    command_finished || session_ended
+}
+
+fn end_agent(st: &mut PaneState) {
+    if let Some(agent) = st.agent {
+        let argv = st.agent_argv.take().or_else(|| {
+            st.agent_session
+                .as_ref()
+                .and_then(|session| session.launch_argv.clone())
+        });
+        st.ended_agent = Some((agent, argv));
+    }
+    st.agent_session = None;
+    st.agent_argv = None;
+    st.agent = None;
+    // Even if process detection stayed at None, a client may have seeded a
+    // queued resume. A completed shell command invalidates that seed too.
+    notify(st, DaemonMsg::Agent(None));
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -2722,13 +2767,14 @@ fn apply_agent_signals(
     st: &mut PaneState,
     events: Vec<crate::core::cli_agent::AgentEvent>,
     notification: Option<String>,
-) {
+) -> bool {
     use crate::core::cli_agent::{AgentEventKind, AgentSessionState, AgentStatus};
 
     if events.is_empty() && notification.is_none() {
-        return;
+        return false;
     }
     let before = st.agent_session.clone();
+    let mut session_ended = false;
 
     for event in &events {
         let same_session = match (
@@ -2747,13 +2793,21 @@ fn apply_agent_signals(
             // process in this pane. Only the session that still owns the row
             // may remove it; a late Claude shutdown must not erase Cursor.
             if st.agent.is_some() && same_agent && same_session {
-                st.agent_session = None;
-                st.agent_argv = None;
-                st.agent = None;
-                notify(st, DaemonMsg::Agent(None));
+                end_agent(st);
+                session_ended = true;
             }
             continue;
         }
+
+        if event.kind != AgentEventKind::SessionStart
+            && st
+                .ended_agent
+                .as_ref()
+                .is_some_and(|(agent, _)| event.agent.is_none_or(|reported| reported == *agent))
+        {
+            continue;
+        }
+        st.ended_agent = None;
 
         if let Some(agent) = event.agent
             && st.agent != Some(agent)
@@ -2791,6 +2845,7 @@ fn apply_agent_signals(
     if st.agent_session != before {
         notify(st, DaemonMsg::AgentStatus(st.agent_session.clone()));
     }
+    session_ended && st.agent.is_none()
 }
 
 fn apply_probed_cwd(st: &mut PaneState, probed: Option<PathBuf>) {
@@ -2828,6 +2883,13 @@ fn apply_agent(
     st: &mut PaneState,
     detected: Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>,
 ) {
+    if let (Some((ended, previous)), Some((agent, argv))) = (&st.ended_agent, &detected)
+        && ended == agent
+        && (argv.is_empty() || previous.as_ref().is_none_or(|previous| previous == argv))
+    {
+        return;
+    }
+    st.ended_agent = None;
     let (agent, argv) = match detected {
         Some((agent, argv)) => (Some(agent), Some(argv)),
         None => (None, None),
@@ -5181,6 +5243,7 @@ mod tests {
             agent: None,
             agent_session: None,
             agent_argv: None,
+            ended_agent: None,
             alive,
             exit_code: None,
         }
@@ -5262,7 +5325,9 @@ mod tests {
                 Arc::new(Mutex::new(state)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(OutputGate::new()),
-                Box::new(std::io::Cursor::new(b"\x1b]0;shell starting\x07".to_vec())),
+                Box::new(std::io::Cursor::new(
+                    b"\x1b]0;shell starting\x07\x1b]133;A\x07".to_vec(),
+                )),
                 null_writer(),
                 |_| false,
                 ForegroundProbes {
@@ -5690,6 +5755,223 @@ mod tests {
         assert_eq!(st.agent, None);
         assert!(st.agent_session.is_none());
         assert!(st.agent_argv.is_none());
+    }
+
+    #[test]
+    fn session_end_survives_stale_process_observations() {
+        use crate::core::cli_agent::{AgentEvent, AgentEventKind, CLIAgent, command_argv};
+
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        let detected = Some((
+            CLIAgent::Claude,
+            command_argv(&format!("claude --resume {id}")),
+        ));
+        let mut st = test_state(true);
+        apply_agent(&mut st, detected.clone());
+        apply_agent_signals(
+            &mut st,
+            vec![AgentEvent {
+                agent: Some(CLIAgent::Claude),
+                kind: AgentEventKind::SessionEnd,
+                session_id: Some(id.into()),
+                message: None,
+                cwd: None,
+                prompt: None,
+            }],
+            None,
+        );
+
+        // The read carrying SessionEnd may have probed the still-live process,
+        // and later output may reach another probe before the process exits.
+        for observation in [
+            detected.clone(),
+            Some((CLIAgent::Claude, Vec::new())),
+            detected.clone(),
+        ] {
+            apply_agent(&mut st, observation);
+            assert!(
+                observed_facts(&st).agent.is_none(),
+                "an ended session cannot be inferred again"
+            );
+            assert!(st.agent_session.is_none());
+        }
+
+        // A confirmed process exit separates an intentional new invocation,
+        // even if the user resumes the very same conversation again.
+        apply_agent(&mut st, None);
+        apply_agent(&mut st, detected);
+        assert_eq!(
+            st.agent_session.as_ref().unwrap().session_id.as_deref(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn an_ended_invocation_does_not_block_a_new_session() {
+        use crate::core::cli_agent::{AgentEvent, AgentEventKind, CLIAgent, command_argv};
+
+        let old = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        let new = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c18";
+        let event = |kind, id: &str| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: Some(id.into()),
+            message: None,
+            cwd: None,
+            prompt: None,
+        };
+        let detect = |id| {
+            Some((
+                CLIAgent::Claude,
+                command_argv(&format!("claude --resume {id}")),
+            ))
+        };
+        let mut st = test_state(true);
+        apply_agent(&mut st, detect(old));
+        apply_agent_signals(&mut st, vec![event(AgentEventKind::SessionEnd, old)], None);
+        apply_agent_signals(&mut st, vec![event(AgentEventKind::Stop, old)], None);
+        assert!(
+            st.agent_session.is_none(),
+            "a late status cannot reopen the session"
+        );
+
+        apply_agent(&mut st, detect(new));
+        assert_eq!(
+            st.agent_session.as_ref().unwrap().session_id.as_deref(),
+            Some(new)
+        );
+        apply_agent_signals(&mut st, vec![event(AgentEventKind::SessionEnd, old)], None);
+        assert_eq!(
+            st.agent_session.as_ref().unwrap().session_id.as_deref(),
+            Some(new)
+        );
+
+        apply_agent_signals(&mut st, vec![event(AgentEventKind::SessionEnd, new)], None);
+        apply_agent_signals(
+            &mut st,
+            vec![event(AgentEventKind::SessionStart, old)],
+            None,
+        );
+        assert_eq!(
+            st.agent_session.as_ref().unwrap().session_id.as_deref(),
+            Some(old),
+            "an explicit start takes priority over the ended invocation"
+        );
+
+        apply_agent_signals(&mut st, vec![event(AgentEventKind::SessionEnd, old)], None);
+        let mut sniffer = OscSniffer::new();
+        apply_signals(&mut st, sniffer.feed(b"\x1b]133;A\x07\x1b]133;C\x07"));
+        apply_agent(&mut st, detect(old));
+        assert_eq!(
+            st.agent_session.as_ref().unwrap().session_id.as_deref(),
+            Some(old),
+            "a new shell command may intentionally resume the same id"
+        );
+    }
+
+    #[test]
+    fn a_same_read_session_end_clears_the_seeded_machine_identity() {
+        use crate::core::cli_agent::{CLIAgent, command_argv};
+        use crate::core::machine::{
+            AgentFacts, MACHINE_FILE, MachineStore, OBSERVE_SLOT, PaneSeed, publish_observations,
+            withdraw_observations,
+        };
+
+        let _slot = OBSERVE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = MachineStore::open(dir.path().join(MACHINE_FILE));
+        let workspace = store.workspace_create(None, None, None).unwrap();
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        let argv = command_argv(&format!("claude --resume {id}"));
+        let mut seed = PaneSeed::bare(1);
+        seed.agent = Some(AgentFacts {
+            agent: CLIAgent::Claude,
+            session_id: Some(id.into()),
+            launch_argv: Some(argv.clone()),
+            status: None,
+        });
+        store
+            .tab_create(workspace.id, None, seed, None, None)
+            .unwrap();
+        publish_observations(&store);
+        let mut state = test_state(true);
+        state.id = 1;
+        let state = Arc::new(Mutex::new(state));
+        let output = format!(
+            "\x1b]777;notify;tty7://cli-agent;{{\"agent\":\"claude\",\"event\":\"session-end\",\"session_id\":\"{id}\"}}\x07"
+        );
+        DaemonPane::spawn_reader(
+            state.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(std::io::Cursor::new(output.into_bytes())),
+            null_writer(),
+            |_| true,
+            ForegroundProbes {
+                remote: Box::new(|| None),
+                agent: Box::new(move || Some(Some((CLIAgent::Claude, argv.clone())))),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        )
+        .join()
+        .unwrap();
+        withdraw_observations();
+        assert!(state.lock().unwrap().agent_session.is_none());
+        assert!(
+            store.pane(1).unwrap().agent.is_none(),
+            "a same-read hook must clear the saved seed even when before/after both have no agent"
+        );
+    }
+
+    #[test]
+    fn a_failed_resume_clears_machine_identity_after_the_command_finishes() {
+        use crate::core::cli_agent::{CLIAgent, command_argv};
+        use crate::core::machine::{
+            AgentFacts, MACHINE_FILE, MachineStore, OBSERVE_SLOT, PaneSeed, publish_observations,
+            withdraw_observations,
+        };
+
+        let _slot = OBSERVE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = MachineStore::open(dir.path().join(MACHINE_FILE));
+        let workspace = store.workspace_create(None, None, None).unwrap();
+        let mut seed = PaneSeed::bare(1);
+        seed.agent = Some(AgentFacts {
+            agent: CLIAgent::Codex,
+            session_id: Some("0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17".into()),
+            launch_argv: Some(command_argv(
+                "codex resume 0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17",
+            )),
+            status: None,
+        });
+        store
+            .tab_create(workspace.id, None, seed, None, None)
+            .unwrap();
+        publish_observations(&store);
+        let mut state = test_state(true);
+        state.id = 1;
+        // No agent process was ever found. The initial prompt precedes the
+        // queued command, then the shell reports its failed execution.
+        DaemonPane::spawn_reader(
+            Arc::new(Mutex::new(state)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(std::io::Cursor::new(b"\x1b]133;A\x07\x1b]133;C\x07codex: command not found\r\n\x1b]133;D;127\x07\x1b]133;A\x07".to_vec())),
+            null_writer(),
+            |_| false,
+            ForegroundProbes {
+                remote: Box::new(|| None),
+                agent: Box::new(|| Some(None)),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        ).join().unwrap();
+        withdraw_observations();
+        assert!(
+            store.pane(1).unwrap().agent.is_none(),
+            "the next restart must not retry a failed resume"
+        );
     }
 
     #[test]
