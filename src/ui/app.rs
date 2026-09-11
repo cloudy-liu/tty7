@@ -3258,20 +3258,17 @@ impl Tty7App {
             return;
         }
         let was_focused = pending.read(cx).focus_handle.contains_focused(window, cx);
-        let resume = (!parts.restored)
-            .then(|| {
-                let spawn = &pending.read(cx).spawn;
-                agent_resume_command(
-                    &spawn.agent,
-                    spawn.agent_session_id.as_deref(),
-                    spawn.agent_launch_argv.as_deref(),
-                    cx,
-                )
-            })
-            .flatten();
+        let restored = parts.restored;
         let view = build_terminal_view(parts, font_size, window, cx);
-        if let Some(cmd) = resume {
-            view.read(cx).run_command_line(&cmd);
+        if !restored {
+            let spawn = &pending.read(cx).spawn;
+            resume_agent_in_terminal(
+                view.read(cx),
+                &spawn.agent,
+                spawn.agent_session_id.as_deref(),
+                spawn.agent_launch_argv.as_deref(),
+                cx,
+            );
         }
         let slot = PaneSlot::Ready(view.clone());
         self.tabs
@@ -7795,7 +7792,9 @@ fn agent_resume_command(
         return None;
     }
     let agent = agent.as_ref()?;
-    let Some(session_id) = session_id else {
+    let Some(session_id) =
+        session_id.or_else(|| launch_argv.and_then(|argv| agent.resumed_session_id(argv)))
+    else {
         log::info!(
             "{}'s pane had no captured session id; it comes back as a plain shell",
             agent.display_name()
@@ -7855,6 +7854,22 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             agent_session_id: None,
             agent_launch_argv: None,
         },
+    }
+}
+
+fn resume_agent_in_terminal(
+    terminal: &TerminalView,
+    agent: &Option<crate::core::cli_agent::CLIAgent>,
+    session_id: Option<&str>,
+    launch_argv: Option<&[String]>,
+    cx: &App,
+) {
+    if let Some(command) = agent_resume_command(agent, session_id, launch_argv, cx) {
+        let agent = agent.expect("a resume command has an agent");
+        let session_id = session_id
+            .or_else(|| launch_argv.and_then(|argv| agent.resumed_session_id(argv)))
+            .expect("a resume command has a session id");
+        terminal.run_resumed_agent(agent, session_id, &command);
     }
 }
 
@@ -8052,14 +8067,13 @@ fn session_to_pane(
             };
             match &view {
                 PaneSlot::Ready(terminal) if !terminal.read(cx).restored() => {
-                    if let Some(cmd) = agent_resume_command(
+                    resume_agent_in_terminal(
+                        terminal.read(cx),
                         agent,
                         agent_session_id.as_deref(),
                         agent_launch_argv.as_deref(),
                         cx,
-                    ) {
-                        terminal.read(cx).run_command_line(&cmd);
-                    }
+                    );
                 }
                 PaneSlot::Ready(_) => {}
                 PaneSlot::Connecting(pending) => {
@@ -9175,6 +9189,134 @@ mod tests {
             !session(Some("Fork Session"), Some("abc"), true).forkable(),
             "a remote pane would fork the wrong machine's session"
         );
+    }
+
+    #[gpui::test]
+    fn a_resumed_pane_saves_its_session_before_any_daemon_report(cx: &mut gpui::TestAppContext) {
+        use super::{Tab, pane_to_session, resume_agent_in_terminal};
+        use crate::core::cli_agent::{CLIAgent, command_argv};
+        use crate::core::session::SessionPane;
+        use crate::terminal::view::quiet_test_pane;
+        use crate::ui::pane::{Pane, PaneSlot};
+        use crate::ui::tree_sync::{DesiredNode, desired_tabs};
+        use tty7_core::core::machine::{AgentFacts, MACHINE_FILE, MachineStore, PaneSeed};
+
+        let (app, mut vcx) = super::test_window::harness(cx);
+        let session_id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for agent in CLIAgent::ALL {
+            let launch = match agent {
+                CLIAgent::Aider => continue,
+                CLIAgent::Codex => "codex --yolo".to_string(),
+                CLIAgent::Claude => "claude --dangerously-skip-permissions".to_string(),
+                _ => agent.resume_command(session_id, None).unwrap(),
+            };
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(MACHINE_FILE);
+            let mut store = MachineStore::open(path.clone());
+            let workspace = store.workspace_create(None, None, None).unwrap();
+            let mut seed = PaneSeed::bare(1);
+            seed.agent = Some(AgentFacts {
+                agent,
+                session_id: Some(session_id.into()),
+                launch_argv: Some(command_argv(&launch)),
+                status: None,
+            });
+            store
+                .tab_create(workspace.id, None, seed, None, None)
+                .unwrap();
+
+            for pane in 2..=3 {
+                let saved = store.pane(pane - 1).unwrap().agent.unwrap();
+                let (seed, _daemon) = app.update_in(&mut vcx, |app, window, cx| {
+                    let (view, daemon) = quiet_test_pane(pane, window, cx);
+                    resume_agent_in_terminal(
+                        view.read(cx),
+                        &Some(saved.agent),
+                        saved.session_id.as_deref(),
+                        saved.launch_argv.as_deref(),
+                        cx,
+                    );
+                    app.tabs = vec![Tab::new(Pane::leaf(PaneSlot::Ready(view)))];
+                    let session = pane_to_session(&app.tabs[0].pane, cx);
+                    let SessionPane::Leaf {
+                        agent_session_id, ..
+                    } = session
+                    else {
+                        panic!("a single terminal saves as a leaf");
+                    };
+                    assert_eq!(
+                        agent_session_id.as_deref(),
+                        Some(session_id),
+                        "the first save must retain the id before any daemon report"
+                    );
+                    let (tabs, _, _) = desired_tabs(app, cx);
+                    let DesiredNode::Leaf { seed, .. } = &tabs[0].root else {
+                        panic!("the tree saves the same terminal as a leaf");
+                    };
+                    (seed.clone(), daemon)
+                });
+                store
+                    .pane_replace(workspace.id, pane - 1, seed, None)
+                    .unwrap();
+                store.flush();
+                store = MachineStore::open(path.clone());
+                assert_eq!(
+                    store
+                        .pane(pane)
+                        .unwrap()
+                        .agent
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some(session_id)
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn missing_session_metadata_can_recover_an_explicit_resume(cx: &mut gpui::TestAppContext) {
+        use super::agent_resume_command;
+        use crate::core::cli_agent::{CLIAgent, command_argv};
+        use crate::core::config::Config;
+
+        cx.update(|cx| {
+            cx.set_global(Config::default());
+            let launch = command_argv("codex resume 0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17 --yolo");
+            assert_eq!(
+                agent_resume_command(&Some(CLIAgent::Codex), None, Some(&launch), cx),
+                Some(launch.join(" "))
+            );
+            assert_eq!(
+                agent_resume_command(&Some(CLIAgent::Codex), Some("new-id"), Some(&launch), cx),
+                Some("codex resume new-id --yolo".into()),
+                "a newer hook id wins"
+            );
+
+            for command in [
+                "codex fork 0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17 --yolo",
+                "codex resume --last",
+                "codex --yolo",
+            ] {
+                assert!(
+                    agent_resume_command(
+                        &Some(CLIAgent::Codex),
+                        None,
+                        Some(&command_argv(command)),
+                        cx
+                    )
+                    .is_none()
+                );
+            }
+            cx.global_mut::<Config>().restore_agent_sessions = false;
+            assert!(
+                agent_resume_command(&Some(CLIAgent::Codex), None, Some(&launch), cx).is_none()
+            );
+            assert!(
+                agent_resume_command(&Some(CLIAgent::Codex), Some("known-id"), Some(&launch), cx)
+                    .is_none()
+            );
+        });
     }
 
     #[gpui::test]

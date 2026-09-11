@@ -1370,13 +1370,33 @@ impl RemoteTerminal {
                             }
                             DaemonMsg::Agent(a) => {
                                 flush_batch!();
-                                if let Ok(mut guard) = agent.lock() {
+                                let clear_session = if let Ok(mut guard) = agent.lock() {
+                                    let changed = a.is_none() || guard.is_some_and(|old| Some(old) != a);
                                     *guard = a;
+                                    changed
+                                } else {
+                                    false
+                                };
+                                if clear_session && let Ok(mut guard) = agent_session.lock() {
+                                    *guard = None;
+                                    proxy.send_event(AlacEvent::Wakeup);
                                 }
                             }
-                            DaemonMsg::AgentStatus(state) => {
+                            DaemonMsg::AgentStatus(mut state) => {
                                 flush_batch!();
+                                let detected_agent = agent.lock().ok().and_then(|g| *g);
                                 if let Ok(mut guard) = agent_session.lock() {
+                                    if let (Some(next), Some(known)) = (&mut state, guard.as_ref())
+                                        && next.launch_argv.as_deref().is_none_or(|argv| {
+                                            detected_agent.zip(known.session_id.as_deref())
+                                                .is_some_and(|(agent, id)| agent.resumes_session(id, argv))
+                                        })
+                                    {
+                                        next.session_id = next.session_id.take()
+                                            .or_else(|| known.session_id.clone());
+                                        next.launch_argv = next.launch_argv.take()
+                                            .or_else(|| known.launch_argv.clone());
+                                    }
                                     *guard = state;
                                 }
                                 proxy.send_event(AlacEvent::Wakeup);
@@ -1588,6 +1608,27 @@ impl RemoteTerminal {
 
     pub fn agent_session(&self) -> Option<AgentSessionState> {
         self.agent_session.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Keep the identity used to resume a dead pane available to its first
+    /// save, before the daemon has detected the process or received a hook.
+    pub fn seed_resumed_agent(&self, agent: CLIAgent, session_id: &str, launch_argv: Vec<String>) {
+        let (Ok(mut current_agent), Ok(mut current_session)) =
+            (self.agent.lock(), self.agent_session.lock())
+        else {
+            return;
+        };
+        if current_agent.is_some_and(|current| current != agent) {
+            return;
+        }
+        *current_agent = Some(agent);
+        let session = current_session.get_or_insert_with(AgentSessionState::default);
+        if session.session_id.is_none() {
+            session.session_id = Some(session_id.to_string());
+        }
+        if session.launch_argv.is_none() {
+            session.launch_argv = Some(launch_argv);
+        }
     }
 
     /// This pane's agent turns, anchored to the scrollback. Same cheap handle
@@ -2762,6 +2803,153 @@ fn win_size(size: TermSize, cell_w: u16, cell_h: u16) -> WinSize {
         rows: size.rows as u16,
         cell_w,
         cell_h,
+    }
+}
+
+#[cfg(test)]
+mod agent_resume_tests {
+    use super::*;
+
+    fn socket_pair() -> (Stream, Stream) {
+        #[cfg(unix)]
+        {
+            std::os::unix::net::UnixStream::pair().unwrap()
+        }
+        #[cfg(windows)]
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            (client, listener.accept().unwrap().0)
+        }
+    }
+
+    fn wait_for(term: &RemoteTerminal, ready: impl Fn(&RemoteTerminal) -> bool) {
+        for _ in 0..200 {
+            if ready(term) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the daemon's agent report did not reach the terminal");
+    }
+
+    #[test]
+    fn every_resumable_agent_keeps_its_id_for_the_same_captured_command() {
+        crate::core::config::pin_test_config_dir();
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for agent in CLIAgent::ALL {
+            if agent == CLIAgent::Aider {
+                continue;
+            }
+            let (client, mut daemon) = socket_pair();
+            let term = RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
+            let argv =
+                crate::core::cli_agent::command_argv(&agent.resume_command(id, None).unwrap());
+            term.seed_resumed_agent(agent, id, argv.clone());
+            DaemonMsg::AgentStatus(Some(AgentSessionState {
+                status: crate::core::cli_agent::AgentStatus::Waiting,
+                launch_argv: Some(argv),
+                ..Default::default()
+            }))
+            .encode(&mut daemon)
+            .unwrap();
+            wait_for(&term, |term| {
+                term.agent_session()
+                    .is_some_and(|s| s.status == crate::core::cli_agent::AgentStatus::Waiting)
+            });
+            assert_eq!(
+                term.agent_session().unwrap().session_id.as_deref(),
+                Some(id),
+                "{agent:?}"
+            );
+
+            let different = agent.resume_command("different-session", None).unwrap();
+            DaemonMsg::AgentStatus(Some(AgentSessionState {
+                status: crate::core::cli_agent::AgentStatus::Working,
+                launch_argv: Some(crate::core::cli_agent::command_argv(&different)),
+                ..Default::default()
+            }))
+            .encode(&mut daemon)
+            .unwrap();
+            wait_for(&term, |term| {
+                term.agent_session()
+                    .is_some_and(|s| s.status == crate::core::cli_agent::AgentStatus::Working)
+            });
+            assert!(
+                term.agent_session().unwrap().session_id.is_none(),
+                "{agent:?} must not carry its old id to a different command"
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_identity_tracks_daemon_updates() {
+        crate::core::config::pin_test_config_dir();
+        let (client, mut daemon) = socket_pair();
+        let term = RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
+        let seed = || term.seed_resumed_agent(CLIAgent::Codex, "restored", vec!["codex".into()]);
+        seed();
+        assert_eq!(term.foreground_agent(), Some(CLIAgent::Codex));
+        let session = term.agent_session().unwrap();
+        assert_eq!(session.session_id.as_deref(), Some("restored"));
+        assert!(!session.rich);
+
+        DaemonMsg::Agent(Some(CLIAgent::Codex))
+            .encode(&mut daemon)
+            .unwrap();
+        DaemonMsg::AgentStatus(Some(AgentSessionState {
+            status: crate::core::cli_agent::AgentStatus::Waiting,
+            ..Default::default()
+        }))
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for(&term, |term| {
+            term.agent_session()
+                .is_some_and(|s| s.status == crate::core::cli_agent::AgentStatus::Waiting)
+        });
+        assert_eq!(
+            term.agent_session().unwrap().session_id.as_deref(),
+            Some("restored"),
+            "a status report without launch metadata does not erase the resumed identity"
+        );
+        DaemonMsg::AgentStatus(Some(AgentSessionState {
+            session_id: Some("reported".into()),
+            rich: true,
+            ..Default::default()
+        }))
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for(&term, |term| {
+            term.agent_session()
+                .is_some_and(|s| s.session_id.as_deref() == Some("reported"))
+        });
+        seed();
+        assert_eq!(
+            term.agent_session().unwrap().session_id.as_deref(),
+            Some("reported"),
+            "seeding cannot overwrite an id that has already arrived"
+        );
+
+        // An older daemon may clear the foreground agent without ever having
+        // created a session of its own, so Agent(None) must clear the seed too.
+        DaemonMsg::Agent(None).encode(&mut daemon).unwrap();
+        wait_for(&term, |term| {
+            term.foreground_agent().is_none() && term.agent_session().is_none()
+        });
+
+        seed();
+        DaemonMsg::Agent(Some(CLIAgent::Claude))
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(&term, |term| {
+            term.foreground_agent() == Some(CLIAgent::Claude) && term.agent_session().is_none()
+        });
+        seed();
+        assert_eq!(term.foreground_agent(), Some(CLIAgent::Claude));
+        assert!(
+            term.agent_session().is_none(),
+            "a different agent cannot inherit the resumed id"
+        );
     }
 }
 

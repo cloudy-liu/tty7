@@ -168,6 +168,91 @@ impl CLIAgent {
         }
     }
 
+    /// An explicit conversation id in a captured resume command. Hooks remain
+    /// authoritative; this fills the gap before a resumed agent sends one.
+    /// A fork's argument identifies its parent, and a name or `--last` can
+    /// select a different conversation on the next launch, so neither counts.
+    pub fn resumed_session_id(self, argv: &[String]) -> Option<&str> {
+        if !matches!(self, CLIAgent::Codex | CLIAgent::Claude) {
+            return None;
+        }
+        let args = self.invocation_args(argv)?;
+        let args = &args[..args.iter().position(|s| s == "--").unwrap_or(args.len())];
+        let conflicting: &[&str] = match self {
+            CLIAgent::Codex => &["--last"],
+            CLIAgent::Claude => &[
+                "--fork-session",
+                "--continue",
+                "-c",
+                "--session-id",
+                "--from-pr",
+            ],
+            _ => unreachable!(),
+        };
+        if args
+            .iter()
+            .any(|s| conflicting.contains(&s.split('=').next().unwrap_or(s)))
+        {
+            return None;
+        }
+        let id = match self {
+            CLIAgent::Codex => {
+                if args.first()?.as_str() != "resume" {
+                    return None;
+                }
+                args.get(1)?.as_str()
+            }
+            CLIAgent::Claude => {
+                let mut ids = args.iter().enumerate().filter_map(|(i, arg)| {
+                    if arg == "--resume" || arg == "-r" {
+                        args.get(i + 1).map(String::as_str)
+                    } else {
+                        arg.strip_prefix("--resume=")
+                    }
+                });
+                let id = ids.next()?;
+                if ids.next().is_some() {
+                    return None;
+                }
+                id
+            }
+            _ => unreachable!(),
+        };
+        self.replay_flags(argv)?;
+        (id.len() == 36 && uuid::Uuid::try_parse(id).is_ok()).then_some(id)
+    }
+
+    /// Whether this is the resume command tty7 would queue for an already
+    /// known id. Unlike recovering an unknown id, this works for every agent
+    /// with a resume command, including agents whose ids are not UUIDs.
+    pub fn resumes_session(self, session_id: &str, argv: &[String]) -> bool {
+        let Some(args) = self.invocation_args(argv) else {
+            return false;
+        };
+        let Some(command) = self.resume_command(session_id, Some(argv)) else {
+            return false;
+        };
+        args == &command_argv(&command)[1..]
+    }
+
+    fn invocation_args(self, argv: &[String]) -> Option<&[String]> {
+        let argv = &argv[argv.iter().take_while(|t| is_env_assignment(t)).count()..];
+        let (program, args) = argv.split_first()?;
+        let program = program.to_ascii_lowercase();
+        if Self::match_token(base_stem(&program)) == Some(self) {
+            Some(args)
+        } else if is_interpreter(base_stem(&program)) {
+            let named = args.iter().position(|arg| {
+                arg.split(['/', '\\']).any(|part| {
+                    Self::match_token(base_stem(&part.to_ascii_lowercase())) == Some(self)
+                })
+            })?;
+            Some(&args[named + 1..])
+        } else {
+            None
+        }
+    }
+
     fn opts_out_of_sessions(self, argv: &[String]) -> bool {
         let ephemeral: &[&str] = match self {
             CLIAgent::Pi | CLIAgent::OhMyPi => &["--no-session"],
@@ -1290,6 +1375,133 @@ mod tests {
 
         s.apply_event(&ev(AgentEventKind::SessionEnd, None));
         assert_eq!(s.cwd, None, "session end releases the cwd claim");
+    }
+
+    #[test]
+    fn resume_ids_are_explicit_and_never_fork_parents() {
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for (agent, prefix, suffix) in [
+            (CLIAgent::Codex, "codex resume", "--yolo"),
+            (CLIAgent::Codex, r"C:\Tools\codex.exe resume", "--yolo"),
+            (
+                CLIAgent::Codex,
+                "node /opt/@openai/codex/bin/codex.js resume",
+                "--yolo",
+            ),
+            (
+                CLIAgent::Claude,
+                "claude --dangerously-skip-permissions --resume",
+                "",
+            ),
+            (CLIAgent::Claude, "claude -r", "--model Opus"),
+            (CLIAgent::Claude, "env claude --resume", ""),
+        ] {
+            let captured = command_argv(&format!("{prefix} {id} {suffix}"));
+            assert_eq!(
+                agent.resumed_session_id(&captured),
+                Some(id),
+                "{captured:?}"
+            );
+        }
+        assert_eq!(
+            CLIAgent::Claude.resumed_session_id(&argv(&["claude", &format!("--resume={id}")])),
+            Some(id)
+        );
+        for (agent, command) in [
+            (CLIAgent::Codex, format!("codex fork {id} --yolo")),
+            (CLIAgent::Codex, "codex resume --last".into()),
+            (CLIAgent::Codex, format!("codex resume {id} --last")),
+            (CLIAgent::Codex, format!("codex -- {id}")),
+            (CLIAgent::Codex, "codex resume my-session".into()),
+            (CLIAgent::Codex, "codex resume $(whoami)".into()),
+            (CLIAgent::Codex, format!("echo codex resume {id}")),
+            (CLIAgent::Codex, format!("codex resume {id} && codex")),
+            (
+                CLIAgent::Claude,
+                format!("claude --resume {id} --fork-session"),
+            ),
+            (
+                CLIAgent::Claude,
+                format!("claude --resume {id} --fork-session=true"),
+            ),
+            (CLIAgent::Claude, format!("claude --continue --resume {id}")),
+            (CLIAgent::Claude, format!("claude -- --resume {id}")),
+            (
+                CLIAgent::Claude,
+                format!("claude --resume {id} --resume {id}"),
+            ),
+            (CLIAgent::Claude, "claude --resume my-session".into()),
+        ] {
+            assert_eq!(
+                agent.resumed_session_id(&command_argv(&command)),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_resume_ids_survive_executable_wrappers_but_not_a_new_session() {
+        for (agent, id, command) in [
+            (
+                CLIAgent::Cursor,
+                "cursor-123",
+                "cursor-agent --resume cursor-123",
+            ),
+            (
+                CLIAgent::Cursor,
+                "cursor-123",
+                "node /opt/cursor-agent/index.js --resume cursor-123",
+            ),
+            (
+                CLIAgent::Antigravity,
+                "agy-123",
+                "C:/Tools/agy.exe --conversation agy-123",
+            ),
+            (
+                CLIAgent::Grok,
+                "grok-123",
+                "grok --model grok-code-fast-1 --resume grok-123",
+            ),
+            (
+                CLIAgent::OpenCode,
+                "ses_123abc",
+                "opencode --session ses_123abc",
+            ),
+            (CLIAgent::Amp, "T-123abc", "amp threads continue T-123abc"),
+            (
+                CLIAgent::Goose,
+                "20260911_1",
+                "goose session --resume --session-id 20260911_1",
+            ),
+            (CLIAgent::Pi, "pi-123", "pi --session pi-123"),
+        ] {
+            let captured = command_argv(command);
+            assert!(agent.resumes_session(id, &captured), "{command}");
+            assert!(
+                !agent.resumes_session("different-session", &captured),
+                "{command}"
+            );
+            assert_eq!(
+                agent.resumed_session_id(&captured),
+                None,
+                "preserving a known id does not infer an unknown one"
+            );
+        }
+        for (agent, command) in [
+            (CLIAgent::Cursor, "cursor-agent --continue"),
+            (CLIAgent::Cursor, "cursor-agent"),
+            (CLIAgent::Antigravity, "agy --continue"),
+            (CLIAgent::Grok, "grok --resume known --fork-session"),
+            (CLIAgent::Amp, "amp threads fork known"),
+            (CLIAgent::OpenCode, "opencode --session known --fork"),
+            (CLIAgent::Aider, "aider"),
+        ] {
+            assert!(
+                !agent.resumes_session("known", &command_argv(command)),
+                "{command}"
+            );
+        }
     }
 
     #[test]
