@@ -601,6 +601,7 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     // in `render`, because the graph reads it once per visible row per frame
     // and each entry costs a contrast bisection on three surfaces.
     cx.set_global(presets::ActiveLanes(theme.lanes()));
+    cx.set_global(theme.agent_icons());
 
     let t = Theme::global_mut(cx);
     let mut base: Hsla = rgb(m.background).into();
