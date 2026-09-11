@@ -94,6 +94,8 @@ struct PaneRecord {
     agent: Option<crate::core::cli_agent::CLIAgent>,
     agent_argv: Option<Vec<String>>,
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
+    #[serde(default)]
+    ended_agent: Option<(crate::core::cli_agent::CLIAgent, Option<Vec<String>>)>,
     /// Length of this pane's ring in the data section, which follows the
     /// manifest in pane order.
     ring_len: u32,
@@ -242,6 +244,7 @@ fn stage(panes: &[Carried], next_pane_id: u64) -> std::io::Result<std::fs::File>
             agent: pane.agent,
             agent_argv: pane.agent_argv.clone(),
             agent_session: pane.agent_session.clone(),
+            ended_agent: pane.ended_agent.clone(),
             ring_len: encoded.len() as u32,
         });
         data.extend_from_slice(&encoded);
@@ -376,6 +379,7 @@ pub fn adopt(fd: RawFd) -> Option<Adopted> {
             agent: record.agent,
             agent_argv: record.agent_argv,
             agent_session: record.agent_session,
+            ended_agent: record.ended_agent,
         });
     }
 
@@ -420,19 +424,19 @@ mod tests {
             agent: None,
             agent_argv: None,
             agent_session: None,
+            ended_agent: None,
         }
     }
 
     #[test]
     fn panes_cross_the_blob_with_their_descriptors_and_their_screens() {
-        let staged = stage(
-            &[
-                carried(7, 31, b"first pane"),
-                carried(9, 32, b"second pane"),
-            ],
-            10,
-        )
-        .expect("stage the blob");
+        let mut first = carried(7, 31, b"first pane");
+        let ended = Some((
+            crate::core::cli_agent::CLIAgent::Claude,
+            Some(vec!["claude".into()]),
+        ));
+        first.ended_agent = ended.clone();
+        let staged = stage(&[first, carried(9, 32, b"second pane")], 10).expect("stage the blob");
 
         let adopted = adopt(std::os::fd::IntoRawFd::into_raw_fd(staged)).expect("read it back");
         assert_eq!(adopted.next_pane_id, 10, "ids must not be handed out twice");
@@ -447,6 +451,10 @@ mod tests {
         assert_eq!(adopted.panes[0].ring[0].bytes, b"first pane");
         assert_eq!(adopted.panes[0].cwd, Some(PathBuf::from("/work")));
         assert!(adopted.panes[0].at_prompt);
+        assert_eq!(
+            adopted.panes[0].ended_agent, ended,
+            "an exec must not let a stale process probe revive an ended session"
+        );
         assert_eq!(
             adopted.panes[1].ring[0].bytes, b"second pane",
             "each pane's ring has to be read back at its own offset, not the first one's"

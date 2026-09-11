@@ -20,7 +20,9 @@ The original launch flags are replayed, so the pane comes back the way you
 started it, not the way the defaults would.
 
 A restored pane keeps its session id while the agent starts. Another server
-restart before the next prompt can resume the same conversation again.
+restart before its next hook arrives can resume the same conversation again.
+Exiting the agent, or returning to the shell after a failed resume, clears the
+pane's session identity.
 
 When tty7 already knows the session id, restore is supported for every recognised
 agent except Aider. Turn it off with `restore_agent_sessions: false`.

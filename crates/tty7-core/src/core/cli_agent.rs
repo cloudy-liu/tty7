@@ -177,44 +177,74 @@ impl CLIAgent {
             return None;
         }
         let args = self.invocation_args(argv)?;
-        let args = &args[..args.iter().position(|s| s == "--").unwrap_or(args.len())];
-        let conflicting: &[&str] = match self {
-            CLIAgent::Codex => &["--last"],
-            CLIAgent::Claude => &[
-                "--fork-session",
-                "--continue",
-                "-c",
-                "--session-id",
-                "--from-pr",
-            ],
-            _ => unreachable!(),
-        };
-        if args
-            .iter()
-            .any(|s| conflicting.contains(&s.split('=').next().unwrap_or(s)))
-        {
-            return None;
-        }
         let id = match self {
             CLIAgent::Codex => {
-                if args.first()?.as_str() != "resume" {
+                let args = &args[..args.iter().position(|s| s == "--").unwrap_or(args.len())];
+                if args.first()?.as_str() != "resume"
+                    || args.iter().any(|s| s.split('=').next() == Some("--last"))
+                {
                     return None;
                 }
                 args.get(1)?.as_str()
             }
             CLIAgent::Claude => {
-                let mut ids = args.iter().enumerate().filter_map(|(i, arg)| {
-                    if arg == "--resume" || arg == "-r" {
-                        args.get(i + 1).map(String::as_str)
-                    } else {
-                        arg.strip_prefix("--resume=")
+                let mut id = None;
+                let mut args = args.iter().map(String::as_str);
+                while let Some(arg) = args.next() {
+                    let (flag, value) = arg
+                        .split_once('=')
+                        .map_or((arg, None), |(f, v)| (f, Some(v)));
+                    match flag {
+                        "--" => break,
+                        "--fork-session" | "--continue" | "-c" | "--session-id" | "--from-pr" => {
+                            return None;
+                        }
+                        "--resume" | "-r" => {
+                            if id.is_some() || (flag == "-r" && value.is_some()) {
+                                return None;
+                            }
+                            id = Some(value.or_else(|| args.next())?);
+                        }
+                        "--dangerously-skip-permissions"
+                        | "--allow-dangerously-skip-permissions"
+                        | "--verbose"
+                        | "--strict-mcp-config"
+                        | "--disable-slash-commands"
+                        | "--ide"
+                        | "--chrome"
+                        | "--no-chrome"
+                            if value.is_none() => {}
+                        "--model"
+                        | "--fallback-model"
+                        | "--effort"
+                        | "--permission-mode"
+                        | "--permission-prompt-tool"
+                        | "--agent"
+                        | "--agents"
+                        | "--system-prompt"
+                        | "--append-system-prompt"
+                        | "--system-prompt-file"
+                        | "--append-system-prompt-file"
+                        | "--settings"
+                        | "--setting-sources"
+                        | "--mcp-config"
+                        | "--allowedTools"
+                        | "--allowed-tools"
+                        | "--disallowedTools"
+                        | "--disallowed-tools"
+                        | "--tools"
+                        | "--add-dir"
+                        | "--plugin-dir" => {
+                            // Required values can themselves look like --resume.
+                            // Unknown/variadic syntax stays with the hook fallback.
+                            if value.is_none() {
+                                args.next()?;
+                            }
+                        }
+                        _ => return None,
                     }
-                });
-                let id = ids.next()?;
-                if ids.next().is_some() {
-                    return None;
                 }
-                id
+                id?
             }
             _ => unreachable!(),
         };
@@ -650,14 +680,40 @@ impl CLIAgent {
 
 /// Splits a shell-integration command capture into argv tokens, preserving
 /// case so the result can serve as `launch_argv` for flag replay on resume.
-/// Quoted arguments containing spaces come out split; `replay_flags` rejects
-/// such tokens rather than replaying them wrong.
+/// Keep quoted text in one token: a flag mentioned inside a prompt is data.
+/// This only groups quotes, without shell expansion or backslash unescaping;
+/// `replay_flags` rejects tokens that cannot safely be replayed.
 pub fn command_argv(command: &str) -> Vec<String> {
-    let mut argv: Vec<String> = command
-        .split_whitespace()
-        .map(|t| t.trim_matches(['"', '\'']).to_string())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let mut argv = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for ch in command.chars() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            } else {
+                token.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            started = true;
+        } else if ch.is_whitespace() {
+            if started {
+                argv.push(std::mem::take(&mut token));
+                started = false;
+            }
+        } else {
+            token.push(ch);
+            started = true;
+        }
+    }
+    if quote.is_some() {
+        return Vec::new();
+    }
+    if started {
+        argv.push(token);
+    }
     if argv.first().is_some_and(|t| t == "&") {
         argv.remove(0);
     }
@@ -1214,6 +1270,17 @@ mod tests {
         );
         assert_eq!(command_argv("  "), [""; 0]);
         assert_eq!(
+            command_argv(
+                r#"& "C:\Program Files\claude.exe" --system-prompt "explain --resume example""#
+            ),
+            [
+                r"C:\Program Files\claude.exe",
+                "--system-prompt",
+                "explain --resume example"
+            ]
+        );
+        assert!(command_argv("claude --system-prompt 'unfinished").is_empty());
+        assert_eq!(
             CLIAgent::Claude
                 .resume_command(
                     "abc",
@@ -1394,6 +1461,11 @@ mod tests {
                 "",
             ),
             (CLIAgent::Claude, "claude -r", "--model Opus"),
+            (
+                CLIAgent::Claude,
+                "claude --model Opus --permission-mode bypassPermissions --resume",
+                "",
+            ),
             (CLIAgent::Claude, "env claude --resume", ""),
         ] {
             let captured = command_argv(&format!("{prefix} {id} {suffix}"));
@@ -1436,6 +1508,53 @@ mod tests {
                 agent.resumed_session_id(&command_argv(&command)),
                 None,
                 "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_resume_selectors_are_not_option_values() {
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for option in ["--append-system-prompt", "--system-prompt", "--model"] {
+            let captured = argv(&["claude", option, &format!("--resume={id}")]);
+            assert_eq!(
+                CLIAgent::Claude.resumed_session_id(&captured),
+                None,
+                "{captured:?}"
+            );
+        }
+        for prompt in [
+            format!("--resume {id}"),
+            format!("plain text --resume {id}"),
+            format!("--resume={id} --resume {id}"),
+        ] {
+            let command = format!("claude --system-prompt '{prompt}'");
+            assert_eq!(
+                CLIAgent::Claude.resumed_session_id(&command_argv(&command)),
+                None,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            CLIAgent::Claude.resumed_session_id(&argv(&[
+                "claude",
+                "--unknown-option",
+                &format!("--resume={id}"),
+            ])),
+            None,
+            "an option with unknown arity cannot establish a session id"
+        );
+        for value in [format!("--resume={id}"), "--fork-session".into()] {
+            assert_eq!(
+                CLIAgent::Claude.resumed_session_id(&argv(&[
+                    "claude",
+                    "--append-system-prompt",
+                    &value,
+                    "--resume",
+                    id,
+                ])),
+                Some(id),
+                "only the real selector controls this resume"
             );
         }
     }
