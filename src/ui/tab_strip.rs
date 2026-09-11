@@ -1184,20 +1184,13 @@ impl Tty7App {
                     None => agent.display_name().to_string(),
                 };
                 base.relative()
-                    .rounded_full()
-                    .bg(gpui::rgb(agent.accent_rgb()))
-                    // Codex and Grok are both pure black, which is the window
-                    // fill on a dark theme — the disc dissolves and leaves the
-                    // glyph floating. A hairline keeps it a disc in any theme.
-                    .when(
-                        crate::ui::presets::needs_edge(agent.accent_rgb(), cx.theme().background),
-                        |d| d.border_1().border_color(cx.theme().border),
-                    )
                     .child(
                         gpui::svg()
                             .path(agent.icon_path())
-                            .size(px(size * 0.54))
-                            .text_color(gpui::white()),
+                            .size(px(size * 0.78))
+                            .text_color(gpui::rgb(
+                                cx.global::<crate::ui::presets::AgentIcons>().ink(agent),
+                            )),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
                     .tooltip(move |window, cx| {
@@ -2012,23 +2005,6 @@ mod tests {
             agent_status_label(Some(AgentStatus::Waiting)),
             agent_status_label(Some(AgentStatus::Done))
         );
-    }
-
-    #[test]
-    fn a_brand_disc_that_matches_the_window_gets_an_edge() {
-        use crate::ui::presets::needs_edge;
-        let dark: gpui::Hsla = gpui::rgb(0x111111).into();
-        let light: gpui::Hsla = gpui::rgb(0xffffff).into();
-        let codex = crate::core::cli_agent::CLIAgent::Codex.accent_rgb();
-        let claude = crate::core::cli_agent::CLIAgent::Claude.accent_rgb();
-
-        assert_eq!(codex, 0x000000, "Codex's disc is pure black");
-        assert!(
-            needs_edge(codex, dark),
-            "a black disc on a dark window is not a disc"
-        );
-        assert!(!needs_edge(codex, light));
-        assert!(!needs_edge(claude, dark) && !needs_edge(claude, light));
     }
 
     #[test]

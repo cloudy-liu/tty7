@@ -4,6 +4,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use gpui::{App, Global, Hsla};
 use serde::Deserialize;
 
+use crate::core::cli_agent::CLIAgent;
 use crate::terminal::palette::ActivePalette;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +143,16 @@ pub struct Lanes {
 pub struct ActiveLanes(pub Lanes);
 
 impl Global for ActiveLanes {}
+
+pub(crate) struct AgentIcons([u32; CLIAgent::ALL.len()]);
+
+impl Global for AgentIcons {}
+
+impl AgentIcons {
+    pub(crate) fn ink(&self, agent: CLIAgent) -> u32 {
+        self.0[agent as usize]
+    }
+}
 
 impl Theme {
     pub fn background_color(&self) -> u32 {
@@ -302,6 +313,34 @@ impl Theme {
         }
     }
 
+    /// Transparent glyphs share one colour across the sidebar, tab strip and
+    /// switcher. Clear their resting, hover and selected fills so the glyph
+    /// stays legible without changing colour when the row is highlighted.
+    pub(crate) fn agent_icons(&self) -> AgentIcons {
+        let m = self.neutrals();
+        let surfaces = self.surfaces();
+        let backgrounds = [
+            m.background,
+            m.muted,
+            m.secondary,
+            m.sidebar,
+            surfaces.sidebar.hover,
+            surfaces.sidebar.selected,
+            m.popover,
+            surfaces.popover.hover,
+            surfaces.popover.pressed,
+        ];
+        let mut inks = [0; CLIAgent::ALL.len()];
+        for agent in CLIAgent::ALL {
+            let seed = match agent {
+                CLIAgent::Codex | CLIAgent::Cursor | CLIAgent::Grok => m.foreground,
+                _ => agent.accent_rgb(),
+            };
+            inks[agent as usize] = agent_icon_ink(seed, &backgrounds);
+        }
+        AgentIcons(inks)
+    }
+
     pub fn active_palette(&self, legible: bool) -> ActivePalette {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
@@ -427,15 +466,6 @@ pub(crate) fn caret_ink(caret: Hsla, background: Hsla, foreground: Hsla) -> Hsla
     } else {
         foreground
     }
-}
-
-/// Whether a filled shape needs a hairline to stay a shape. A brand colour is a
-/// fixed value; a theme background is not, and pure black on a dark window is
-/// no shape at all.
-pub(crate) fn needs_edge(fill: u32, surface: Hsla) -> bool {
-    let rgb = crate::terminal::palette::hsla_to_rgb(surface);
-    let packed = (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32;
-    contrast(fill, packed) < 1.25
 }
 
 /// Whether a surface is dark enough that a halo cut in its own colour stops
@@ -585,6 +615,38 @@ fn legible_ink(bg: u32, seed: u32, floor: f32) -> u32 {
         0x000000
     };
     bisect_contrast(seed, away, bg, floor)
+}
+
+fn agent_icon_ink(seed: u32, backgrounds: &[u32]) -> u32 {
+    let weakest = |ink| {
+        backgrounds
+            .iter()
+            .map(|bg| contrast(ink, *bg))
+            .fold(f32::INFINITY, f32::min)
+    };
+    if weakest(seed) >= TEXT_FLOOR {
+        return seed;
+    }
+    let away = if weakest(0xffffff) >= weakest(0x000000) {
+        0xffffff
+    } else {
+        0x000000
+    };
+    // A midtone custom theme can make 4.5:1 impossible across all row states.
+    // Keep the better endpoint instead of fixing one state at another's expense.
+    if weakest(away) < TEXT_FLOOR {
+        return away;
+    }
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..16 {
+        let mid = (lo + hi) / 2.0;
+        if weakest(mix(seed, away, mid)) >= TEXT_FLOOR {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    mix(seed, away, hi)
 }
 
 fn legible_accent(bg: u32, accent: u32) -> u32 {
@@ -1381,6 +1443,71 @@ static BUILTINS: [BuiltinSpec; 13] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_icons_are_legible_on_every_builtin_row_state() {
+        for theme in builtins() {
+            let m = theme.neutrals();
+            let sf = theme.surfaces();
+            let icons = theme.agent_icons();
+            for (area, backgrounds) in [
+                ("tab strip", [m.background, m.muted, m.secondary]),
+                (
+                    "sidebar",
+                    [m.sidebar, sf.sidebar.hover, sf.sidebar.selected],
+                ),
+                (
+                    "switcher",
+                    [m.popover, sf.popover.hover, sf.popover.pressed],
+                ),
+            ] {
+                for agent in CLIAgent::ALL {
+                    for bg in backgrounds {
+                        assert!(
+                            contrast(icons.ink(agent), bg) >= 4.5,
+                            "{} / {area} / {}: {:.2}:1 on #{bg:06x}",
+                            theme.id,
+                            agent.display_name(),
+                            contrast(icons.ink(agent), bg),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neutral_agent_icons_follow_the_theme_and_legible_brand_colors_stay_authored() {
+        let mut theme = builtins().remove(0);
+        for (background, foreground) in [(0x000000, 0xffffff), (0xffffff, 0x111111)] {
+            theme.background = Fill::Solid(background);
+            theme.foreground = foreground;
+            let icons = theme.agent_icons();
+            for agent in [CLIAgent::Codex, CLIAgent::Cursor, CLIAgent::Grok] {
+                assert_eq!(icons.ink(agent), foreground, "{}", agent.display_name());
+            }
+            if background == 0 {
+                assert_eq!(icons.ink(CLIAgent::Goose), CLIAgent::Goose.accent_rgb());
+            } else {
+                assert!(is_lighter(
+                    CLIAgent::Claude.accent_rgb(),
+                    icons.ink(CLIAgent::Claude),
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn agent_icons_choose_the_best_common_contrast_on_midtone_custom_themes() {
+        let backgrounds = [0x666666, 0x808080];
+        for seed in [0x000000, 0xffffff, CLIAgent::Claude.accent_rgb()] {
+            let ink = agent_icon_ink(seed, &backgrounds);
+            assert_eq!(ink, 0xffffff);
+            for bg in backgrounds {
+                assert!(contrast(ink, bg) >= 3.0);
+            }
+        }
+    }
 
     #[test]
     fn foreground_is_legible_on_background() {
