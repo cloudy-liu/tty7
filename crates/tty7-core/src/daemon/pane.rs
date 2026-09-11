@@ -2022,6 +2022,10 @@ impl DaemonPane {
                                 && let (Some(before), Some(after)) = (facts_before, facts_after)
                                 && facts_changed(&before, &after)
                             {
+                                let agent_changed = agent_facts_changed(
+                                    before.agent.as_ref(),
+                                    after.agent.as_ref(),
+                                );
                                 crate::core::machine::observe_pane(pane, |p| {
                                     if after.cwd.is_some() {
                                         p.cwd = after.cwd;
@@ -2029,7 +2033,30 @@ impl DaemonPane {
                                     // Unlike the others this one is also cleared
                                     // by a reset, so it is assigned either way.
                                     p.osc_title = after.osc_title;
-                                    p.agent = after.agent;
+                                    // The window may have seeded a queued resume
+                                    // before process detection. A title/cwd update
+                                    // must not erase that identity.
+                                    if agent_changed {
+                                        let mut agent = after.agent;
+                                        if let (Some(known), Some(observed)) = (&p.agent, &mut agent)
+                                            && known.agent == observed.agent
+                                            && observed.launch_argv.as_deref().is_none_or(|argv| {
+                                                known.session_id.as_deref().is_some_and(|id| {
+                                                    observed.agent.resumes_session(id, argv)
+                                                })
+                                            })
+                                        {
+                                            // Keep a known id while the same queued
+                                            // resume starts, even for agents with no
+                                            // hook. Windows identity-only probes also
+                                            // cannot invalidate the saved command.
+                                            observed.session_id = observed.session_id.take()
+                                                .or_else(|| known.session_id.clone());
+                                            observed.launch_argv = observed.launch_argv.take()
+                                                .or_else(|| known.launch_argv.clone());
+                                        }
+                                        p.agent = agent;
+                                    }
                                     if after.shell.is_some() {
                                         p.shell = after.shell;
                                     }
@@ -2829,11 +2856,22 @@ fn stamp_launch_argv(st: &mut PaneState, argv: Option<Vec<String>>) {
     if st.agent_argv.as_ref() == Some(&argv) {
         return;
     }
+    let before = st.agent_session.clone();
+    let resumed_id = st
+        .agent
+        .and_then(|agent| agent.resumed_session_id(&argv))
+        .map(str::to_string);
+    if resumed_id.is_some() {
+        st.agent_session.get_or_insert_with(Default::default);
+    }
     st.agent_argv = Some(argv.clone());
-    if let Some(sess) = &mut st.agent_session
-        && sess.launch_argv.as_ref() != Some(&argv)
-    {
+    if let Some(sess) = &mut st.agent_session {
+        if !sess.rich {
+            sess.session_id = resumed_id;
+        }
         sess.launch_argv = Some(argv);
+    }
+    if st.agent_session != before {
         notify(st, DaemonMsg::AgentStatus(st.agent_session.clone()));
     }
 }
@@ -5191,6 +5229,249 @@ mod tests {
             facts.agent.unwrap().launch_argv.as_deref(),
             Some(&["claude".to_string()][..])
         );
+    }
+
+    #[test]
+    fn shell_startup_does_not_erase_a_seeded_resume_identity() {
+        use crate::core::cli_agent::CLIAgent;
+        use crate::core::machine::{
+            AgentFacts, MACHINE_FILE, MachineStore, OBSERVE_SLOT, PaneSeed, publish_observations,
+            withdraw_observations,
+        };
+
+        let _slot = OBSERVE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = MachineStore::open(dir.path().join(MACHINE_FILE));
+        let workspace = store.workspace_create(None, None, None).unwrap();
+        let expected = AgentFacts {
+            agent: CLIAgent::Codex,
+            session_id: Some("0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17".into()),
+            launch_argv: None,
+            status: None,
+        };
+        let mut seed = PaneSeed::bare(1);
+        seed.agent = Some(expected.clone());
+        store
+            .tab_create(workspace.id, None, seed, None, None)
+            .unwrap();
+        for detected in [None, Some((CLIAgent::Codex, Vec::new()))] {
+            publish_observations(&store);
+            let mut state = test_state(true);
+            state.id = 1;
+            DaemonPane::spawn_reader(
+                Arc::new(Mutex::new(state)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(OutputGate::new()),
+                Box::new(std::io::Cursor::new(b"\x1b]0;shell starting\x07".to_vec())),
+                null_writer(),
+                |_| false,
+                ForegroundProbes {
+                    remote: Box::new(|| None),
+                    agent: Box::new(move || Some(detected.clone())),
+                    cwd: Box::new(|| None),
+                },
+                Arc::new(DeathReporter::new(|| {})),
+            )
+            .join()
+            .unwrap();
+            withdraw_observations();
+            let saved = store.pane(1).unwrap();
+            assert_eq!(saved.osc_title.as_deref(), Some("shell starting"));
+            assert_eq!(
+                saved.agent,
+                Some(expected.clone()),
+                "a title or identity-only report must not erase the queued resume"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inferred_resume_id_follows_the_observed_command() {
+        use crate::core::cli_agent::{CLIAgent, command_argv};
+
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for command in [
+            format!("codex fork {id}"),
+            "codex resume --last".into(),
+            "codex".into(),
+        ] {
+            let mut state = test_state(true);
+            apply_agent(
+                &mut state,
+                Some((CLIAgent::Codex, command_argv(&format!("codex resume {id}")))),
+            );
+            apply_agent(&mut state, Some((CLIAgent::Codex, Vec::new())));
+            assert_eq!(
+                state.agent_session.as_ref().unwrap().session_id.as_deref(),
+                Some(id),
+                "Windows identity-only probes must not erase the captured command"
+            );
+            apply_agent(&mut state, Some((CLIAgent::Codex, command_argv(&command))));
+            assert!(
+                state
+                    .agent_session
+                    .as_ref()
+                    .and_then(|s| s.session_id.as_ref())
+                    .is_none(),
+                "the new command {command} has not reported its own id"
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_session_identity_yields_to_hooks_and_clears_on_exit() {
+        use crate::core::cli_agent::{AgentStatus, CLIAgent, command_argv};
+
+        let mut state = test_state(true);
+        let resumed = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        apply_agent(
+            &mut state,
+            Some((
+                CLIAgent::Codex,
+                command_argv(&format!("codex resume {resumed} --yolo")),
+            )),
+        );
+        let session = state.agent_session.as_ref().unwrap();
+        assert_eq!(session.session_id.as_deref(), Some(resumed));
+        assert_eq!(session.status, AgentStatus::Idle);
+        assert!(
+            !session.rich,
+            "launch metadata does not claim that hooks are installed"
+        );
+
+        let mut sniffer = OscSniffer::new();
+        apply_signals(
+            &mut state,
+            sniffer.feed(
+                concat!(
+                    "\x1b]777;notify;tty7://cli-agent;",
+                    r#"{"agent":"codex","event":"session-start","session_id":"new-session"}"#,
+                    "\x07",
+                )
+                .as_bytes(),
+            ),
+        );
+        apply_agent(
+            &mut state,
+            Some((
+                CLIAgent::Codex,
+                command_argv(&format!(r"C:\Tools\codex.exe resume {resumed} --yolo")),
+            )),
+        );
+        assert_eq!(
+            state.agent_session.as_ref().unwrap().session_id.as_deref(),
+            Some("new-session"),
+            "a later process probe must not replace the hook's new id"
+        );
+
+        apply_agent(&mut state, None);
+        assert!(observed_facts(&state).agent.is_none());
+        assert!(state.agent_session.is_none());
+        for command in [
+            format!("codex fork {resumed}"),
+            "codex resume --last".into(),
+            "codex --yolo".into(),
+        ] {
+            apply_agent(&mut state, Some((CLIAgent::Codex, command_argv(&command))));
+            assert!(
+                state.agent_session.is_none(),
+                "{command} must wait for its own hook id"
+            );
+            apply_agent(&mut state, None);
+        }
+    }
+
+    #[test]
+    fn resumed_agents_survive_two_replacements_without_another_hook() {
+        use crate::core::cli_agent::{CLIAgent, command_argv};
+        use crate::core::machine::{
+            AgentFacts, MACHINE_FILE, MachineStore, OBSERVE_SLOT, PaneSeed, publish_observations,
+            withdraw_observations,
+        };
+
+        let _slot = OBSERVE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let session_id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for agent in CLIAgent::ALL {
+            let launch = match agent {
+                CLIAgent::Aider => continue,
+                CLIAgent::Codex => "codex --yolo".to_string(),
+                CLIAgent::Claude => "claude --dangerously-skip-permissions".to_string(),
+                _ => agent.resume_command(session_id, None).unwrap(),
+            };
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(MACHINE_FILE);
+            let mut store = MachineStore::open(path.clone());
+            let workspace = store.workspace_create(None, None, None).unwrap();
+            let mut seed = PaneSeed::bare(1);
+            seed.agent = Some(AgentFacts {
+                agent,
+                session_id: Some(session_id.into()),
+                launch_argv: Some(command_argv(&launch)),
+                status: None,
+            });
+            store
+                .tab_create(workspace.id, None, seed, None, None)
+                .unwrap();
+            let expected = agent
+                .resume_command(session_id, Some(&command_argv(&launch)))
+                .unwrap();
+
+            for pane in 2..=3 {
+                let saved = store.pane(pane - 1).unwrap().agent.unwrap();
+                let command = saved
+                    .agent
+                    .resume_command(
+                        saved
+                            .session_id
+                            .as_deref()
+                            .expect("the previous restore kept its id"),
+                        saved.launch_argv.as_deref(),
+                    )
+                    .unwrap();
+                assert_eq!(command, expected);
+                let mut seed = PaneSeed::bare(pane);
+                if !matches!(agent, CLIAgent::Codex | CLIAgent::Claude) {
+                    // All resumable agents must retain the id the window saved.
+                    // Codex/Claude additionally recover it from argv alone.
+                    seed.agent = Some(saved);
+                }
+                store
+                    .pane_replace(workspace.id, pane - 1, seed, None)
+                    .unwrap();
+                publish_observations(&store);
+
+                let mut state = test_state(true);
+                state.id = pane;
+                let argv = command_argv(&command);
+                // Process detection sees the resumed command before any hook.
+                // The reader must write its identity through to machine.json.
+                DaemonPane::spawn_reader(
+                    Arc::new(Mutex::new(state)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(OutputGate::new()),
+                    Box::new(std::io::Cursor::new(b"agent ready".to_vec())),
+                    null_writer(),
+                    |_| true,
+                    ForegroundProbes {
+                        remote: Box::new(|| None),
+                        agent: Box::new(move || Some(Some((agent, argv.clone())))),
+                        cwd: Box::new(|| None),
+                    },
+                    Arc::new(DeathReporter::new(|| {})),
+                )
+                .join()
+                .unwrap();
+                withdraw_observations();
+                store.flush();
+                store = MachineStore::open(path.clone());
+                let restored = store.pane(pane).unwrap().agent.unwrap();
+                assert_eq!(
+                    restored.session_id.as_deref(),
+                    Some(session_id),
+                    "{agent:?} lost its id after replacement {pane}, before any new hook"
+                );
+            }
+        }
     }
 
     #[test]

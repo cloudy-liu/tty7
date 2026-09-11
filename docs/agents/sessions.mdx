@@ -19,13 +19,22 @@ claude --dangerously-skip-permissions --resume 8f3c…
 The original launch flags are replayed, so the pane comes back the way you
 started it, not the way the defaults would.
 
-Supported for every recognised agent except Aider. Turn it off with
-`restore_agent_sessions: false`.
+A restored pane keeps its session id while the agent starts. Another server
+restart before the next prompt can resume the same conversation again.
+
+When tty7 already knows the session id, restore is supported for every recognised
+agent except Aider. Turn it off with `restore_agent_sessions: false`.
 
 <Note>
-  Resume needs the agent's hooks installed, since the session id comes from
-  them. [Installing hooks →](/agents/status)
+  Hooks capture the id for new conversations. For Codex and Claude, tty7 can
+  also recover an explicit session id from a saved resume command.
+  [Installing hooks →](/agents/status)
 </Note>
+
+Cursor, Antigravity (`agy`), Amp, Auggie, Hermes and Vibe have resume commands but
+no built-in tty7 hooks to capture new conversation ids. Recognising their process
+alone is not enough to restore a conversation. An id already reported to tty7 is
+preserved across restarts, but a new conversation without one returns as a shell.
 
 ## Fork a live session
 

@@ -1709,6 +1709,20 @@ impl TerminalView {
         self.terminal.write(format!("{cmd}\r").into_bytes());
     }
 
+    pub fn run_resumed_agent(
+        &self,
+        agent: crate::core::cli_agent::CLIAgent,
+        session_id: &str,
+        command: &str,
+    ) {
+        self.terminal.seed_resumed_agent(
+            agent,
+            session_id,
+            crate::core::cli_agent::command_argv(command),
+        );
+        self.run_command_line(command);
+    }
+
     pub fn shell_spec(&self) -> Option<ShellSpec> {
         self.shell_spec.clone()
     }
