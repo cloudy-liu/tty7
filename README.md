@@ -4,8 +4,9 @@
 
 ### tty7 · Custom Fork
 
-**A maintained tty7 fork: deeper Windows shell integration, native shell
-history, WSL and SSH fixes, and its own release line.**
+**A maintained tty7 fork with deeper Windows shell integration, reliable coding-agent
+session tracking, theme-aware agent icons, native shell history, WSL and SSH fixes,
+and its own release line.**
 
 <sub>Persistent terminal sessions · remote work · coding agents · pure Rust</sub>
 
@@ -34,10 +35,12 @@ history, WSL and SSH fixes, and its own release line.**
 ## What tty7 is
 
 tty7 is a GPU-rendered terminal workbench whose background server owns shells
-and panes independently of the window. Sessions survive closing the app and can
-be resumed after a reboot. It combines local and remote terminals, native SSH,
-Git workflows, editor-grade prompt input, and awareness of coding agents such
-as Codex and Claude Code.
+and panes independently of the window. Closing the window leaves those shells
+running. After a reboot, tty7 reconstructs saved panes and can relaunch a
+supported coding agent and resume its conversation when the session id is
+known. It combines local and remote terminals, native SSH, Git workflows,
+editor-grade prompt input, and awareness of coding agents such as Codex and
+Claude Code.
 
 The upstream project is the source of truth for the product's full behavior.
 This fork selectively follows upstream while maintaining the changes below.
@@ -47,24 +50,30 @@ This fork selectively follows upstream while maintaining the changes below.
 Everything in this section is a difference from upstream. The **Upstream**
 column records where each change stands with the upstream project:
 
-- **Declined** — proposed upstream and closed there, so it is expected to stay
-  fork-only.
+- **Closed upstream** — proposed upstream and closed there, so it is expected
+  to stay fork-only.
 - **Not submitted** — not yet proposed upstream.
 - **Fork-specific** — only meaningful in a fork, so it will not be proposed.
+- **Fork default** — the feature exists upstream, but this fork ships a
+  different default value.
+
+Changes available only in source builds from `main` are marked **unreleased**.
 
 | Change | Platform | Upstream |
 |---|---|---|
 | CMD and Cmder prompt reporting, completion, and prompt editing | Windows | Not submitted |
 | Coding-agent detection through the Windows process tree | Windows | Not submitted |
 | Shift+Enter under ConPTY win32-input-mode | Windows | Not submitted |
-| In-pane `ssh` hop detection | Windows | [Declined](https://github.com/l0ng-ai/tty7/pull/739) |
+| In-pane `ssh` hop detection | Windows | [Closed upstream](https://github.com/l0ng-ai/tty7/pull/739) |
 | Vim command-line positioning over in-pane SSH | Windows | Not submitted |
 | WSL account login-shell resolution | Windows · WSL | Not submitted |
 | Selectable prompt text and Windows path smart-selection | All | Not submitted |
 | Native shell history for search and suggestions | All | Not submitted |
-| Sidebar group renaming | All | [Declined](https://github.com/l0ng-ai/tty7/pull/735) |
-| Agent badges follow the focused pane | All | [Declined](https://github.com/l0ng-ai/tty7/pull/719) |
-| Antigravity agent icon | All | Not submitted |
+| Sidebar group renaming | All | [Closed upstream](https://github.com/l0ng-ai/tty7/pull/735) |
+| Agent badges follow the focused pane | All | [Closed upstream](https://github.com/l0ng-ai/tty7/pull/719) |
+| Reliable coding-agent identity across restart, failed resume, and exit **(c.6)** | All | Not submitted |
+| Transparent, theme-aware avatars for all 19 agents **(c.6)** | All | Not submitted |
+| Antigravity brand icon support | All | Not submitted |
 | Bell off by default | All | Fork default |
 | Update checks without the GitHub REST API | All | Fork-specific |
 | Custom `-c` release line and update channel | All | Fork-specific |
@@ -124,6 +133,21 @@ is no longer a difference.
 - Keeps those custom names in a stable order in the config file, so saving any
   setting does not reshuffle them.
 - Makes tab agent badges follow the focused pane in a split.
+- Keeps a known coding-agent session id attached to its pane while tty7's
+  existing restore flow starts the agent. It keeps this association even if the
+  server restarts again before the next hook arrives. Codex and Claude can
+  recover an explicit id from a saved resume command. Exiting the agent or
+  returning to the shell after a failed resume clears stale identity instead
+  of leaving the pane attached to an ended conversation. This hardens tty7's
+  resume flow; the agent still owns and stores the conversation. This landed in
+  [cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24).
+- Draws all 19 supported agent marks, including Antigravity, without colored
+  circular backgrounds and increases the glyph from 54% to 78% of the avatar.
+  Codex, Cursor, and Grok follow the theme foreground; the other agents retain
+  their brand hue with brightness correction. Every agent reaches 4.5:1
+  contrast on the resting, hover, and selected fills in the sidebar, tab strip,
+  and switcher across all 13 built-in themes. This landed in
+  [cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25).
 - Ships the Antigravity brand mark for agent avatars.
 
 ### Defaults that differ from upstream
@@ -136,7 +160,7 @@ is no longer a difference.
 
 - Reads the Stable tag from the `github.com` `/releases/latest` redirect and the
   Nightly version from `nightly.json`, rather than the rate-limited REST
-  catalog, so update checks keep working without a token.
+  catalog, avoiding the unauthenticated REST catalog's rate limit.
 
 See [Versioning](#versioning) for the custom release scheme and how the updater
 is pointed at this fork.
@@ -155,10 +179,14 @@ Download the newest fork-maintained build from
 Release assets also include `checksums.txt` and the headless `tty7-server`
 binaries used by remote workspaces.
 
-The current maintenance release is `v26.8.3-c.5`: c.4 plus the SSH/Vim
-command-line fix. The broader `v26.9.1-c` release has been withdrawn. If you
-installed it, download and install c.5 manually; the updater does not downgrade.
-See the [c.5 release record](docs/releases/v26.8.3-c.5.md) for the exact changes.
+`v26.8.3-c.6` builds on c.5's SSH/Vim command-line fix and includes the agent-session identity fixes
+from [cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24) and the
+transparent agent icons from
+[cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25).
+See the [c.6 release record](docs/releases/v26.8.3-c.6.md) for the commit ledger.
+Release assets become available after the draft's builds and checksums are verified.
+The broader `v26.9.1-c` release has been withdrawn. If you installed it,
+download and install c.6 manually once published; the updater does not downgrade.
 
 ## Versioning
 
