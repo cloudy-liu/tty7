@@ -66,8 +66,8 @@ Claude Code 等 coding agent 的状态感知放在同一个应用里。
 | 用于搜索和建议的原生 shell 历史 | 全平台 | 未提交上游 |
 | 侧边栏分组重命名 | 全平台 | [上游已关闭](https://github.com/l0ng-ai/tty7/pull/735) |
 | agent 徽标跟随聚焦的 pane | 全平台 | [上游已关闭](https://github.com/l0ng-ai/tty7/pull/719) |
-| 重启、恢复失败和退出后的 agent 会话身份维护 **（尚未发布）** | 全平台 | 未提交上游 |
-| 19 个 agent 的透明、主题自适应头像 **（尚未发布）** | 全平台 | 未提交上游 |
+| 重启、恢复失败和退出后的 agent 会话身份维护 **（c.6）** | 全平台 | 未提交上游 |
+| 19 个 agent 的透明、主题自适应头像 **（c.6）** | 全平台 | 未提交上游 |
 | Antigravity 品牌图标支持 | 全平台 | 未提交上游 |
 | 响铃默认关闭 | 全平台 | fork 默认值 |
 | 更新检查不走 GitHub REST API | 全平台 | 仅限 fork |
@@ -162,15 +162,12 @@ Claude Code 等 coding agent 的状态感知放在同一个应用里。
 Release 同时提供 `checksums.txt`，以及远程工作区需要的无头
 `tty7-server` 二进制。
 
-当前已发布的维护版本为 `v26.8.3-c.5`，以 c.4 为基线，只追加 SSH/Vim 命令行
-修复。此前同步上游的 `v26.9.1-c` 已撤下；已安装该版本的用户需手动下载安装
-c.5，更新器不会自动降级。完整范围见
-[c.5 发布记录](docs/releases/v26.8.3-c.5.md)。
-
-`main` 还包含已经合并但尚未发布的 agent 会话身份维护修复
+`v26.8.3-c.6` 保留 c.5 的 SSH/Vim 命令行修复，并加入 agent 会话身份维护修复
 [cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24)，以及透明 agent 图标
-[cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25)。源码构建已经包含这些
-改动，它们会随下一次客制版本发布进入安装包。
+[cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25)。逐提交说明见
+[c.6 发布记录](docs/releases/v26.8.3-c.6.md)。草稿的全部构建和校验和验证完成后，
+才会公开发布安装包。此前同步上游的 `v26.9.1-c` 已撤下；已安装该版本的用户需在
+c.6 发布后手动下载安装，更新器不会自动降级。
 
 ## 版本规则
 

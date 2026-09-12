@@ -71,8 +71,8 @@ Changes available only in source builds from `main` are marked **unreleased**.
 | Native shell history for search and suggestions | All | Not submitted |
 | Sidebar group renaming | All | [Closed upstream](https://github.com/l0ng-ai/tty7/pull/735) |
 | Agent badges follow the focused pane | All | [Closed upstream](https://github.com/l0ng-ai/tty7/pull/719) |
-| Reliable coding-agent identity across restart, failed resume, and exit **(unreleased)** | All | Not submitted |
-| Transparent, theme-aware avatars for all 19 agents **(unreleased)** | All | Not submitted |
+| Reliable coding-agent identity across restart, failed resume, and exit **(c.6)** | All | Not submitted |
+| Transparent, theme-aware avatars for all 19 agents **(c.6)** | All | Not submitted |
 | Antigravity brand icon support | All | Not submitted |
 | Bell off by default | All | Fork default |
 | Update checks without the GitHub REST API | All | Fork-specific |
@@ -179,18 +179,14 @@ Download the newest fork-maintained build from
 Release assets also include `checksums.txt` and the headless `tty7-server`
 binaries used by remote workspaces.
 
-The current published maintenance release is `v26.8.3-c.5`: c.4 plus the
-SSH/Vim command-line fix. The broader `v26.9.1-c` release has been withdrawn. If
-you installed it, download and install c.5 manually; the updater does not
-downgrade. See the [c.5 release record](docs/releases/v26.8.3-c.5.md) for the
-exact changes.
-
-`main` also contains the merged but unreleased agent-session identity fixes
+`v26.8.3-c.6` builds on c.5's SSH/Vim command-line fix and includes the agent-session identity fixes
 from [cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24) and the
 transparent agent icons from
-[cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25). They are
-available in source builds and will enter the custom release line with the next
-published release.
+[cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25).
+See the [c.6 release record](docs/releases/v26.8.3-c.6.md) for the commit ledger.
+Release assets become available after the draft's builds and checksums are verified.
+The broader `v26.9.1-c` release has been withdrawn. If you installed it,
+download and install c.6 manually once published; the updater does not downgrade.
 
 ## Versioning
 
