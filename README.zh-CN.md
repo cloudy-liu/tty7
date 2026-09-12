@@ -4,8 +4,9 @@
 
 ### tty7 · 客制维护版
 
-**在 tty7 上持续维护：更深的 Windows shell 集成、原生 shell 历史、
-WSL 与 SSH 修复，以及独立的客制发布线。**
+**在 tty7 上持续维护：更深的 Windows shell 集成、更可靠的 coding-agent
+会话身份维护、随主题适配的 agent 图标、原生 shell 历史、WSL 与 SSH 修复，
+以及独立的客制发布线。**
 
 <sub>会话常驻 · 远程开发 · Coding Agent · 纯 Rust</sub>
 
@@ -33,10 +34,11 @@ WSL 与 SSH 修复，以及独立的客制发布线。**
 
 ## tty7 是什么
 
-tty7 是一个 GPU 渲染的终端工作台。真正持有 shell 和 pane 的是后台
-server，而不是窗口，因此关闭应用甚至重启机器后仍能恢复会话。它把本地与
-远程终端、原生 SSH、Git 工作流、编辑器级提示符输入，以及 Codex、Claude
-Code 等 coding agent 的状态感知放在同一个应用里。
+tty7 是一个 GPU 渲染的终端工作台。真正持有 shell 和 pane 的是后台 server，
+因此关闭窗口后 shell 仍会继续运行。重启机器后，tty7 会从保存状态重建 pane；
+如果已经知道 session id，还能重新启动受支持的 coding agent 并恢复对应对话。
+它把本地与远程终端、原生 SSH、Git 工作流、编辑器级提示符输入，以及 Codex、
+Claude Code 等 coding agent 的状态感知放在同一个应用里。
 
 完整产品能力以上游为准。这个 fork 会选择性同步上游，同时独立维护下面的
 优化。
@@ -48,6 +50,9 @@ Code 等 coding agent 的状态感知放在同一个应用里。
 - **上游已关闭** —— 已向上游提交，但被关闭，因此预计会长期只存在于本 fork。
 - **未提交上游** —— 尚未向上游提交。
 - **仅限 fork** —— 只在 fork 语境下有意义，不会向上游提交。
+- **fork 默认值** —— 功能在上游已经存在，但这个 fork 使用不同的默认配置。
+
+只有从 `main` 源码构建才能使用的改动会明确标记为**尚未发布**。
 
 | 改动 | 平台 | 上游状态 |
 |---|---|---|
@@ -61,7 +66,9 @@ Code 等 coding agent 的状态感知放在同一个应用里。
 | 用于搜索和建议的原生 shell 历史 | 全平台 | 未提交上游 |
 | 侧边栏分组重命名 | 全平台 | [上游已关闭](https://github.com/l0ng-ai/tty7/pull/735) |
 | agent 徽标跟随聚焦的 pane | 全平台 | [上游已关闭](https://github.com/l0ng-ai/tty7/pull/719) |
-| Antigravity agent 图标 | 全平台 | 未提交上游 |
+| 重启、恢复失败和退出后的 agent 会话身份维护 **（尚未发布）** | 全平台 | 未提交上游 |
+| 19 个 agent 的透明、主题自适应头像 **（尚未发布）** | 全平台 | 未提交上游 |
+| Antigravity 品牌图标支持 | 全平台 | 未提交上游 |
 | 响铃默认关闭 | 全平台 | fork 默认值 |
 | 更新检查不走 GitHub REST API | 全平台 | 仅限 fork |
 | 客制 `-c` 发布线与更新通道 | 全平台 | 仅限 fork |
@@ -114,6 +121,17 @@ Code 等 coding agent 的状态感知放在同一个应用里。
   派生的标题。
 - 让这些自定义名称在配置文件中保持稳定顺序，避免保存任意设置时被重新排列。
 - 分屏时，标签页上的 agent 徽标跟随当前聚焦的 pane。
+- 恢复已知的 coding-agent 会话时，在 agent 启动阶段继续保留 session id；即使
+  server 在下一个 hook 到达前再次重启，仍能恢复同一段对话。Codex 与 Claude
+  还能从保存的 resume 命令中取回明确的 id。退出 agent，或者恢复失败后返回 shell
+  时会清除过期身份，不会让 pane 继续绑定到已经结束的会话。这会强化 tty7 现有的
+  会话恢复流程；对话本身仍由 agent 保存和管理。对应改动见
+  [cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24)。
+- 19 个受支持的 agent 头像，包括 Antigravity，不再绘制彩色圆底；图形占头像的比例
+  从 54% 增加到 78%。Codex、Cursor 和 Grok 跟随主题前景色，其他 agent 保留品牌
+  色并校正明暗。在全部 13 套内置主题中，侧边栏、顶部标签栏和切换器的静止、悬停
+  与选中状态都达到 4.5:1 对比度。对应改动见
+  [cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25)。
 - 内置 Antigravity 品牌标识作为 agent 头像。
 
 ### 与上游不同的默认值
@@ -126,7 +144,7 @@ Code 等 coding agent 的状态感知放在同一个应用里。
 
 - 从 `github.com` 的 `/releases/latest` 重定向读取 Stable 标签，从
   `nightly.json` 读取 Nightly 版本，不再依赖有速率限制的 REST 接口，
-  因此不带 token 也能正常检查更新。
+  避免触发未认证 REST catalog 的速率限制。
 
 客制发布规则、以及更新如何指向本 fork，见[版本规则](#版本规则)。
 
@@ -144,9 +162,15 @@ Code 等 coding agent 的状态感知放在同一个应用里。
 Release 同时提供 `checksums.txt`，以及远程工作区需要的无头
 `tty7-server` 二进制。
 
-当前维护版本为 `v26.8.3-c.5`，以 c.4 为基线，只追加 SSH/Vim 命令行修复。
-此前同步上游的 `v26.9.1-c` 已撤下；已安装该版本的用户需手动下载安装 c.5，
-更新器不会自动降级。完整范围见 [c.5 发布记录](docs/releases/v26.8.3-c.5.md)。
+当前已发布的维护版本为 `v26.8.3-c.5`，以 c.4 为基线，只追加 SSH/Vim 命令行
+修复。此前同步上游的 `v26.9.1-c` 已撤下；已安装该版本的用户需手动下载安装
+c.5，更新器不会自动降级。完整范围见
+[c.5 发布记录](docs/releases/v26.8.3-c.5.md)。
+
+`main` 还包含已经合并但尚未发布的 agent 会话身份维护修复
+[cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24)，以及透明 agent 图标
+[cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25)。源码构建已经包含这些
+改动，它们会随下一次客制版本发布进入安装包。
 
 ## 版本规则
 
