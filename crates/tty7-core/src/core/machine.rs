@@ -325,6 +325,15 @@ pub struct AgentFacts {
     pub launch_argv: Option<Vec<String>>,
     #[serde(default)]
     pub status: Option<crate::core::cli_agent::AgentStatus>,
+    /// Legacy restore-choice marker. New clients leave an unknown session at
+    /// the shell; this is never a claim that an agent process is running.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restore_pending: bool,
+    /// Reopen an untouched interactive launch when no conversation exists yet.
+    /// A SessionStart id may already be allocated without resumable history.
+    /// Old records default to unknown; a missing id alone is not evidence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unstarted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

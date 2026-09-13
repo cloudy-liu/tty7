@@ -161,14 +161,18 @@ fn desired_node(pane: &Pane, remote_window: bool, cx: &App) -> Option<DesiredNod
             if remote_window && ssh_spec.is_some() {
                 return None;
             }
-            let agent = view.agent().map(|agent| {
-                let session = view.agent_session();
-                AgentFacts {
-                    agent,
-                    session_id: session.as_ref().and_then(|s| s.session_id.clone()),
-                    launch_argv: session.as_ref().and_then(|s| s.launch_argv.clone()),
-                    status: None,
-                }
+            let agent = view.pending_agent_restore().or_else(|| {
+                view.agent().map(|agent| {
+                    let session = view.agent_session();
+                    AgentFacts {
+                        agent,
+                        session_id: session.as_ref().and_then(|s| s.session_id.clone()),
+                        launch_argv: session.as_ref().and_then(|s| s.launch_argv.clone()),
+                        restore_pending: false,
+                        unstarted: session.as_ref().is_some_and(|s| s.unstarted),
+                        status: None,
+                    }
+                })
             });
             Some(DesiredNode::Leaf {
                 pane: view.pane_id,
@@ -194,6 +198,8 @@ fn desired_node(pane: &Pane, remote_window: bool, cx: &App) -> Option<DesiredNod
                 agent,
                 session_id: spawn.agent_session_id.clone(),
                 launch_argv: spawn.agent_launch_argv.clone(),
+                restore_pending: spawn.agent_restore_pending,
+                unstarted: spawn.agent_unstarted,
                 status: None,
             });
             Some(DesiredNode::Leaf {
@@ -1563,6 +1569,8 @@ fn session_pane_from_node(node: &PaneNode, panes: &[PaneRecord]) -> SessionPane 
                 agent: agent.as_ref().map(|a| a.agent),
                 agent_session_id: agent.as_ref().and_then(|a| a.session_id.clone()),
                 agent_launch_argv: agent.as_ref().and_then(|a| a.launch_argv.clone()),
+                agent_restore_pending: agent.as_ref().is_some_and(|a| a.restore_pending),
+                agent_unstarted: agent.as_ref().is_some_and(|a| a.unstarted),
             }
         }
         PaneNode::Split { axis, ratio, a, b } => SessionPane::Split {
@@ -2439,8 +2447,18 @@ impl Tty7App {
         let applied = match delta {
             LayoutDelta::WorkspaceCreated { .. }
             | LayoutDelta::WorkspaceTouched { .. }
-            | LayoutDelta::WorkspaceRenamed { .. }
-            | LayoutDelta::PaneFacts { .. } => true,
+            | LayoutDelta::WorkspaceRenamed { .. } => true,
+            LayoutDelta::PaneFacts { pane } => {
+                if pane.agent.is_none() {
+                    let host = WorkspaceStore::host_of(cx, self.workspace);
+                    for view in self.tabs.iter().flat_map(|tab| tab.pane.terminals()) {
+                        if view.read(cx).pane_id == pane.id && view.read(cx).host_id() == host {
+                            view.update(cx, |view, cx| view.clear_pending_agent_restore(cx));
+                        }
+                    }
+                }
+                true
+            }
             // Unreachable: `on_layout_delta` hands a deletion to
             // `on_workspace_deleted` and returns before any window is asked. A
             // deletion is about whether this workspace still exists here at
@@ -4721,6 +4739,8 @@ mod tests {
                     agent: CLIAgent::Claude,
                     session_id: Some("sid".into()),
                     launch_argv: Some(vec!["claude".into()]),
+                    restore_pending: false,
+                    unstarted: false,
                     status: None,
                 }),
                 ..PaneRecord::new(2)
