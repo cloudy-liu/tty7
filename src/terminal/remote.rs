@@ -4868,6 +4868,7 @@ mod tests {
             message: Some("Claude needs your permission".into()),
             session_id: Some("sid-1".into()),
             launch_argv: None,
+            unstarted: false,
             rich: true,
             cwd: None,
             activity: 0,
