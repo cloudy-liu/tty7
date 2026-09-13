@@ -159,6 +159,16 @@ fn ancestor_tty_device() -> Option<std::path::PathBuf> {
 
 #[cfg(not(unix))]
 fn write_to_controlling_tty(bytes: &[u8]) -> bool {
+    // PowerShell can finish launching a GUI executable before its hook has
+    // run. The short-lived parent is then gone from the process table, so an
+    // ancestor walk cannot find the pane's console. Its explicit server/pane
+    // address still names the original shell, even after that parent exits.
+    if let Some(pid) = pane_console_pid()
+        && attach_and_write(pid, bytes)
+    {
+        return true;
+    }
+
     let procs = crate::daemon::winproc::snapshot();
     let ancestors = ancestor_pids(&procs);
 
@@ -187,6 +197,30 @@ fn write_to_controlling_tty(bytes: &[u8]) -> bool {
         any |= attach_and_write(pid, bytes);
     }
     any
+}
+
+#[cfg(not(unix))]
+fn pane_console_pid() -> Option<u32> {
+    use crate::daemon::protocol::{ClientMsg, DaemonMsg};
+
+    // Do not resolve an inherited pane id against the default server when
+    // the hook has no explicit server address. Older panes use the existing
+    // ancestor fallback below instead.
+    std::env::var_os("TTY7_CONFIG_DIR").filter(|dir| !dir.is_empty())?;
+    let pane_id = std::env::var("TTY7_PANE").ok()?.parse().ok()?;
+    let mut stream = crate::daemon::transport::connect().ok()?;
+    let timeout = Some(std::time::Duration::from_secs(2));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+    ClientMsg::QueryProcs { pane_id }.encode(&mut stream).ok()?;
+    let DaemonMsg::Procs(procs) = DaemonMsg::read(&mut stream).ok()? else {
+        return None;
+    };
+    procs
+        .procs
+        .into_iter()
+        .find(|process| process.depth == 0 && process.pid != 0)
+        .map(|process| process.pid)
 }
 
 #[cfg(any(not(unix), test))]

@@ -217,6 +217,96 @@ fn process_command_line(pid: u32) -> Option<String> {
     }
 }
 
+/// Files held by one process. In particular, a Codex resume opens its rollout
+/// before it emits SessionStart, so that file identifies the active session.
+pub(crate) fn open_files(pid: u32) -> Vec<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_TYPE_DISK, GetFileType, GetFinalPathNameByHandleW,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION,
+    };
+
+    #[repr(C)]
+    struct HandleEntry {
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        handle_count: usize,
+        pointer_count: usize,
+        access: u32,
+        object_type: u32,
+        attributes: u32,
+        reserved: u32,
+    }
+
+    let mut paths = Vec::new();
+    unsafe {
+        let process = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION, 0, pid);
+        if process.is_null() {
+            return paths;
+        }
+        let mut buffer = vec![0usize; 8192];
+        let mut needed = 0u32;
+        let mut status = NtQueryInformationProcess(
+            process,
+            51,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * size_of::<usize>()) as u32,
+            &mut needed,
+        );
+        if status != 0
+            && needed as usize > buffer.len() * size_of::<usize>()
+            && needed <= 1024 * 1024
+        {
+            buffer.resize((needed as usize).div_ceil(size_of::<usize>()), 0);
+            status = NtQueryInformationProcess(
+                process,
+                51,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * size_of::<usize>()) as u32,
+                &mut needed,
+            );
+        }
+        if status == 0 {
+            let header_size = 2 * size_of::<usize>();
+            let capacity =
+                (buffer.len() * size_of::<usize>() - header_size) / size_of::<HandleEntry>();
+            let entries = buffer.as_ptr().byte_add(header_size).cast::<HandleEntry>();
+            let mut name = vec![0u16; 32768];
+            for i in 0..buffer[0].min(capacity) {
+                let mut duplicate = std::ptr::null_mut();
+                if DuplicateHandle(
+                    process,
+                    (*entries.add(i)).handle,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                ) == 0
+                {
+                    continue;
+                }
+                if GetFileType(duplicate) == FILE_TYPE_DISK {
+                    let len = GetFinalPathNameByHandleW(
+                        duplicate,
+                        name.as_mut_ptr(),
+                        name.len() as u32,
+                        0,
+                    ) as usize;
+                    if len > 0 && len < name.len() {
+                        paths.push(std::ffi::OsString::from_wide(&name[..len]).into());
+                    }
+                }
+                CloseHandle(duplicate);
+            }
+        }
+        CloseHandle(process);
+    }
+    paths
+}
+
 /// Whitespace-and-quotes split. Enough for `ssh -p 22 user@host`; it is not
 /// a full `CommandLineToArgvW`.
 fn split_command_line(line: &str) -> Vec<String> {

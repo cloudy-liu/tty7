@@ -329,6 +329,8 @@ mod tests {
             agent: None,
             agent_session_id: None,
             agent_launch_argv: None,
+            agent_restore_pending: false,
+            agent_unstarted: false,
         }
     }
 

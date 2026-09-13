@@ -31,6 +31,10 @@ pub enum SessionPane {
         agent_session_id: Option<String>,
         #[serde(default)]
         agent_launch_argv: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        agent_restore_pending: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        agent_unstarted: bool,
     },
     Split {
         axis: SessionAxis,

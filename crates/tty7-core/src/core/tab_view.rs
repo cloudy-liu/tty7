@@ -257,6 +257,8 @@ mod tests {
                     agent: CLIAgent::Claude,
                     session_id: None,
                     launch_argv: None,
+                    restore_pending: false,
+                    unstarted: false,
                     status: None,
                 }),
                 ..PaneRecord::new(2)
