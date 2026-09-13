@@ -67,6 +67,7 @@ Claude Code 等 coding agent 的状态感知放在同一个应用里。
 | 侧边栏分组重命名 | 全平台 | [上游已关闭](https://github.com/l0ng-ai/tty7/pull/735) |
 | agent 徽标跟随聚焦的 pane | 全平台 | [上游已关闭](https://github.com/l0ng-ai/tty7/pull/719) |
 | 重启、恢复失败和退出后的 agent 会话身份维护 **（c.6）** | 全平台 | 未提交上游 |
+| server 重启后精确恢复 agent 会话，无法识别时回到 shell **（c.7）** | 全平台 | 未提交上游 |
 | 19 个 agent 的透明、主题自适应头像 **（c.6）** | 全平台 | 未提交上游 |
 | Antigravity 品牌图标支持 | 全平台 | 未提交上游 |
 | 响铃默认关闭 | 全平台 | fork 默认值 |
@@ -127,6 +128,12 @@ Claude Code 等 coding agent 的状态感知放在同一个应用里。
   时会清除过期身份，不会让 pane 继续绑定到已经结束的会话。这会强化 tty7 现有的
   会话恢复流程；对话本身仍由 agent 保存和管理。对应改动见
   [cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24)。
+- 重新启动 agent 前先保存准确的恢复目标。Codex 从原生历史列表进入旧会话后，
+  无需发送新消息也能捕获会话 ID。尚未输入内容的交互式启动会直接重新打开；Claude
+  启动时已分配 ID、但还没有历史记录的空会话也按此处理。无法确定原会话时，留下
+  可用的 shell，不弹出会话选择器。Cursor 与 Antigravity 仍需 tty7 已知准确 ID。
+  详见[会话恢复说明](docs/agents/sessions.mdx)与
+  [cloudy-liu/tty7#29](https://github.com/cloudy-liu/tty7/pull/29)。
 - 19 个受支持的 agent 头像，包括 Antigravity，不再绘制彩色圆底；图形占头像的比例
   从 54% 增加到 78%。Codex、Cursor 和 Grok 跟随主题前景色，其他 agent 保留品牌
   色并校正明暗。在全部 13 套内置主题中，侧边栏、顶部标签栏和切换器的静止、悬停
@@ -162,12 +169,12 @@ Claude Code 等 coding agent 的状态感知放在同一个应用里。
 Release 同时提供 `checksums.txt`，以及远程工作区需要的无头
 `tty7-server` 二进制。
 
-`v26.8.3-c.6` 保留 c.5 的 SSH/Vim 命令行修复，并加入 agent 会话身份维护修复
-[cloudy-liu/tty7#24](https://github.com/cloudy-liu/tty7/pull/24)，以及透明 agent 图标
-[cloudy-liu/tty7#25](https://github.com/cloudy-liu/tty7/pull/25)。逐提交说明见
-[c.6 发布记录](docs/releases/v26.8.3-c.6.md)。草稿的全部构建和校验和验证完成后，
-才会公开发布安装包。此前同步上游的 `v26.9.1-c` 已撤下；已安装该版本的用户需在
-c.6 发布后手动下载安装，更新器不会自动降级。
+`v26.8.3-c.7` 在 c.6 的基础上加入
+[cloudy-liu/tty7#29](https://github.com/cloudy-liu/tty7/pull/29) 的 agent 会话恢复修复。
+准确的会话身份可跨 server 重启保留，尚未输入的空白启动直接重新打开，无法确定
+原会话时留下 shell。逐提交说明见[c.7 发布记录](docs/releases/v26.8.3-c.7.md)。
+草稿的全部构建和校验和验证完成后，才会公开发布安装包。此前同步上游的
+`v26.9.1-c` 已撤下；已安装该版本的用户需手动下载安装 c.7，更新器不会自动降级。
 
 ## 版本规则
 
