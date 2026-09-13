@@ -1,0 +1,9 @@
+Paperglow reading theme
+Adapted from https://github.com/cloudy-liu/Paperglow-Theme
+Source commit: dceea0c9a6fdbb196195e8bd7cbeea106ba47a55
+Original author: Paperglow
+Licensed under Apache License 2.0; see LICENSE.
+
+tty7 changes: converted the Typora light and dark semantic colors to a native
+YAML reading theme, adapted layout for document columns, and used offline font
+fallbacks. Typora application chrome, web fonts and executable styles are omitted.

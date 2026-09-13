@@ -8,6 +8,8 @@ pub mod cli_install;
 pub mod config;
 pub mod explorer_context_menu;
 pub mod keychain;
+pub mod markdown_document;
+pub mod markdown_theme;
 pub mod rate_meter;
 pub mod session;
 pub mod shell_quote;

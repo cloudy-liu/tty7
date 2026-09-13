@@ -131,6 +131,8 @@ pub struct Config {
     pub ui_font_size: f32,
     pub theme: String,
     pub theme_preset: String,
+    /// Reading theme package; its light/dark variant follows the applied UI mode.
+    pub markdown_theme: String,
     pub theme_follow_system: bool,
     pub theme_preset_light: String,
     pub theme_preset_dark: String,
@@ -590,6 +592,7 @@ impl Default for Config {
             ui_font_size: default_ui_font_size(),
             theme: "light".to_string(),
             theme_preset: "light".to_string(),
+            markdown_theme: "paperglow".to_string(),
             theme_follow_system: false,
             theme_preset_light: "light".to_string(),
             theme_preset_dark: "dark".to_string(),

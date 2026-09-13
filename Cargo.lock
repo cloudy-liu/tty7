@@ -3309,7 +3309,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#070d1a28cec5130bf7c4c7895683595d488155b8"
+source = "git+https://github.com/cloudy-liu/gpui-component?rev=2ebbed0674739b5fc56f71bef1b4a436b08321e7#2ebbed0674739b5fc56f71bef1b4a436b08321e7"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3392,7 +3392,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#070d1a28cec5130bf7c4c7895683595d488155b8"
+source = "git+https://github.com/cloudy-liu/gpui-component?rev=2ebbed0674739b5fc56f71bef1b4a436b08321e7#2ebbed0674739b5fc56f71bef1b4a436b08321e7"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3406,7 +3406,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/l0ng-ai/gpui-component?branch=tty7#070d1a28cec5130bf7c4c7895683595d488155b8"
+source = "git+https://github.com/cloudy-liu/gpui-component?rev=2ebbed0674739b5fc56f71bef1b4a436b08321e7#2ebbed0674739b5fc56f71bef1b4a436b08321e7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8054,6 +8054,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9797,12 +9808,14 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "percent-encoding",
  "plist",
  "regex",
  "reqwest_client",
  "resvg",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "serde_yaml",
  "smallvec",
  "smol",
@@ -9811,6 +9824,7 @@ dependencies = [
  "tty7-core",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "uuid",
  "windows 0.58.0",
  "windows-sys 0.61.2",

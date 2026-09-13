@@ -1,0 +1,117 @@
+# Adapted from cloudy-liu/Paperglow-Theme, Typora 0.2.2 (Apache-2.0).
+# See NOTICE and LICENSE in this directory. Sizes use logical pixels.
+schema_version: 1
+id: paperglow
+name: Paperglow
+author: Paperglow
+description: Warm paper and terracotta reading colors, with light and dark variants.
+license: Apache-2.0
+typography:
+  fonts: [Montserrat, Segoe UI, Helvetica Neue, Arial, Noto Sans SC, PingFang SC, Microsoft YaHei]
+  code_fonts: []
+  font_size: 17
+  code_size: 14
+  line_height: 1.5
+  heading_sizes: [32, 27, 23, 20, 18, 17]
+  heading_weights: [700, 600, 500, 500, 500, 500]
+  heading_line_height: 1.4
+  paragraph_gap: 17
+  heading_gap: 24
+layout:
+  max_width: 1100
+  compact_below: 800
+  outer_padding: 24
+  padding: 48
+  compact_padding: 20
+  radius: 16
+  shadow_blur: 22
+  shadow_offset: 10
+  code_padding: 18
+  code_radius: 16
+  quote_padding: 16
+  quote_border: 3
+  quote_radius: 8
+  table_padding: 8
+  list_gap: 4
+light:
+  background: '#f7f2eb'
+  paper: '#fcfaf6'
+  paper_border: 'rgba(96,78,63,0.1)'
+  shadow: 'rgba(70,52,38,0.05)'
+  foreground: '#2b2621'
+  heading: '#1e1915'
+  muted: '#61574f'
+  border: '#ddd5ca'
+  accent: '#bc6a3a'
+  link: '#8f4b28'
+  link_hover: '#743b1f'
+  selection: 'rgba(188,106,58,0.18)'
+  inline_code_background: '#f2ede7'
+  inline_code_foreground: '#a3493f'
+  code_background: '#fcfbf8'
+  code_foreground: '#1c1815'
+  code_border: '#e7ddd2'
+  quote_background: '#f3ede5'
+  quote_foreground: '#4a4039'
+  quote_border: '#c58c64'
+  quote_link: '#625950'
+  quote_code_background: 'rgba(188,106,58,0.12)'
+  quote_code_foreground: '#8c4d31'
+  nested_quote_background: '#ede5da'
+  nested_quote_border: '#d4b89e'
+  alert_background: '#f3ede5'
+  alert_foreground: '#5f554b'
+  alert_border: '#c58c64'
+  table_code_background: '#f5efe8'
+  table_hover: 'rgba(188,106,58,0.045)'
+  syntax:
+    keyword: '#7b47c2'
+    number: '#c06a2a'
+    function: '#2c5ec6'
+    variable: '#342d27'
+    variable_special: '#b26147'
+    type: '#9b641d'
+    comment: '#847a6f'
+    string: '#2f8f2f'
+    tag: '#bb5a49'
+dark:
+  background: '#222120'
+  paper: '#2b2926'
+  paper_border: 'rgba(242,233,223,0.08)'
+  shadow: 'rgba(0,0,0,0.18)'
+  foreground: '#faf8f3'
+  heading: '#faf8f3'
+  muted: '#d5cdc0'
+  border: '#3d3936'
+  accent: '#d59567'
+  link: '#e3a57a'
+  link_hover: '#efbb95'
+  selection: 'rgba(213,149,103,0.22)'
+  inline_code_background: '#332e2b'
+  inline_code_foreground: '#e1a092'
+  code_background: '#2a2725'
+  code_foreground: '#f5efe6'
+  code_border: '#433d38'
+  quote_background: '#2c2926'
+  quote_foreground: '#ddd2c6'
+  quote_border: '#6b5d50'
+  quote_link: '#ddd2c6'
+  quote_code_background: 'rgba(213,149,103,0.16)'
+  quote_code_foreground: '#efbb95'
+  nested_quote_background: '#262320'
+  nested_quote_border: '#584a3e'
+  alert_background: '#2c2926'
+  alert_foreground: '#ddd2c6'
+  alert_border: '#6b5d50'
+  table_code_background: '#312c29'
+  table_hover: 'rgba(213,149,103,0.06)'
+  syntax:
+    keyword: '#b899ff'
+    number: '#d9a56f'
+    function: '#89b1ea'
+    variable: '#f0eae2'
+    variable_special: '#d49a81'
+    type: '#d9a56f'
+    comment: '#ab9d90'
+    string: '#81cb82'
+    tag: '#ea8c79'

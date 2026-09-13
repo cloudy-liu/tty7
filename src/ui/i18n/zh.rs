@@ -158,6 +158,17 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsAnsiColors => "ANSI 颜色",
         L10nKey::SettingsCustomThemes => "自定义主题",
         L10nKey::SettingsThemesRejected => "主题文件夹里这些没能加载",
+        L10nKey::SettingsMarkdownTheme => "Markdown 阅读主题",
+        L10nKey::SettingsMarkdownThemeDesc => {
+            "选择阅读样式，深浅配色自动跟随应用。修改主题文件后自动生效。"
+        }
+        L10nKey::SettingsMarkdownThemeUnavailable => {
+            "无法加载 {requested}，当前使用 {active}。修复主题文件后会自动恢复。"
+        }
+        L10nKey::SettingsMarkdownThemeBuiltin => "内置",
+        L10nKey::SettingsMarkdownThemeUser => "自定义",
+        L10nKey::EditorCopyCode => "复制代码",
+        L10nKey::MarkdownAnchorMissing => "未找到该标题",
         L10nKey::ThemeDuplicateFailed => "无法复制主题",
         L10nKey::ThemeSaveFailed => "无法保存主题",
         L10nKey::OpenInFileManagerFailed => "无法打开 {path}",

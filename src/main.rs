@@ -26,6 +26,38 @@ fn register_bundled_fonts(cx: &mut App) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigWatchChange {
+    Application,
+    Markdown,
+}
+
+fn config_watch_change(
+    event: &notify::Event,
+    config_file: &std::path::Path,
+    markdown_dir: &std::path::Path,
+) -> Option<ConfigWatchChange> {
+    // Reading a file can itself emit an event on Linux.
+    if !tty7_core::host::is_content_change(&event.kind) {
+        return None;
+    }
+    if event
+        .paths
+        .iter()
+        .any(|path| path == config_file || is_theme_file(path))
+    {
+        Some(ConfigWatchChange::Application)
+    } else if event
+        .paths
+        .iter()
+        .any(|path| crate::core::markdown_theme::is_theme_path(path, markdown_dir))
+    {
+        Some(ConfigWatchChange::Markdown)
+    } else {
+        None
+    }
+}
+
 fn spawn_config_watcher(cx: &mut App) {
     use notify::{RecursiveMode, Watcher};
 
@@ -39,21 +71,17 @@ fn spawn_config_watcher(cx: &mut App) {
 
     const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
-    let (tx, rx) = smol::channel::unbounded::<()>();
+    let (tx, rx) = smol::channel::unbounded::<ConfigWatchChange>();
     let watched_file = config_file.clone();
+    let markdown_dir = dir.join(crate::core::markdown_theme::DIRECTORY);
+    let watched_markdown_dir = markdown_dir.clone();
+    let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let event_generation = generation.clone();
     let handler = move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
-        // A reload re-reads the file, and on Linux reading it is itself an
-        // event — see `tty7_core::host::is_content_change`.
-        if !tty7_core::host::is_content_change(&event.kind) {
-            return;
-        }
-        let hit = event
-            .paths
-            .iter()
-            .any(|p| p.file_name() == watched_file.file_name() || is_theme_file(p));
-        if hit {
-            let _ = tx.try_send(());
+        if let Some(change) = config_watch_change(&event, &watched_file, &watched_markdown_dir) {
+            event_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+            let _ = tx.try_send(change);
         }
     };
 
@@ -79,16 +107,53 @@ fn spawn_config_watcher(cx: &mut App) {
         // otherwise re-announce itself on each of them. Cleared by the load
         // that parses, so a second breakage speaks up again.
         let mut announced = false;
-        while rx.recv().await.is_ok() {
+        let mut reload_application = false;
+        while let Ok(change) = rx.recv().await {
+            reload_application |= change == ConfigWatchChange::Application;
             cx.background_executor().timer(DEBOUNCE).await;
-            while rx.try_recv().is_ok() {}
+            while let Ok(change) = rx.try_recv() {
+                reload_application |= change == ConfigWatchChange::Application;
+            }
 
+            let requested_generation = generation.load(std::sync::atomic::Ordering::Acquire);
+            let directory = markdown_dir.clone();
+            let load_application = reload_application;
+            let (config, markdown) = cx
+                .background_executor()
+                .spawn(async move {
+                    (
+                        load_application.then(Config::load_with_outcome),
+                        crate::core::markdown_theme::scan(Some(&directory)),
+                    )
+                })
+                .await;
+            // A save or rename during the read supersedes this snapshot. The
+            // queued event starts another debounced read before anything lands.
+            if generation.load(std::sync::atomic::Ordering::Acquire) != requested_generation {
+                // Keep pending config changes even if only a Markdown save
+                // arrived while this snapshot was loading.
+                continue;
+            }
             cx.update(|cx| {
-                apply_reloaded_config(cx, Config::load_with_outcome(), &mut announced);
+                apply_watched_reload(cx, config, markdown, &mut announced);
             });
+            reload_application = false;
         }
     })
     .detach();
+}
+
+fn apply_watched_reload(
+    cx: &mut App,
+    config: Option<(Config, crate::core::config::LoadOutcome)>,
+    markdown: crate::core::markdown_theme::Snapshot,
+    announced: &mut bool,
+) {
+    // Markdown edits must leave the current application theme preview intact.
+    if let Some(config) = config {
+        apply_reloaded_config(cx, config, announced);
+    }
+    crate::ui::markdown_preview::apply_snapshot(markdown, cx);
 }
 
 /// One watcher tick, once the debounce is out: what a reload does to the
@@ -583,6 +648,8 @@ fn main() {
         log::error!("failed to ensure daemon is running: {e}");
     }
 
+    let markdown_themes =
+        crate::core::markdown_theme::scan(crate::core::markdown_theme::themes_dir().as_deref());
     gpui_platform::application()
         .with_assets(Assets)
         // The window-close path decides whether this process survives: with
@@ -605,6 +672,7 @@ fn main() {
             crate::core::session::WorkspaceStore::init(cx);
             crate::ui::windows::WindowRegistry::init(cx);
             crate::ui::presets::load_registry(cx);
+            crate::ui::markdown_preview::init(markdown_themes, cx);
             crate::ui::theme::apply_cursor_hide_mode(cx);
             spawn_config_watcher(cx);
             crate::core::update::spawn_check(cx);
@@ -634,7 +702,10 @@ fn main() {
 /// tick, so the reload path is exercised without waiting on the filesystem.
 #[cfg(test)]
 mod config_reload_tests {
-    use super::{apply_reloaded_config, is_theme_file};
+    use super::{
+        ConfigWatchChange, apply_reloaded_config, apply_watched_reload, config_watch_change,
+        is_theme_file,
+    };
     use crate::core::actions::SplitRight;
     use crate::core::config::{Config, LoadOutcome};
     use gpui::{Action as _, App, KeyContext, Keystroke, TestAppContext};
@@ -792,6 +863,123 @@ mod config_reload_tests {
         assert!(!is_theme_file(Path::new("/cfg/themes/notes.txt")));
         assert!(!is_theme_file(Path::new("/cfg/config.json")));
         assert!(!is_theme_file(Path::new("/cfg/solar.yaml")));
+    }
+
+    #[test]
+    fn markdown_watch_events_are_separate_from_application_changes() {
+        use notify::event::{AccessKind, DataChange, ModifyKind, RenameMode};
+        use notify::{Event, EventKind};
+        use std::path::Path;
+
+        let config = Path::new("/cfg/config.json");
+        let directory = Path::new("/cfg/markdown-themes");
+        let change = |event| config_watch_change(&event, config, directory);
+        let modified = |path: &str| {
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(path.into())
+        };
+        assert_eq!(
+            change(modified("/cfg/markdown-themes/study.YML")),
+            Some(ConfigWatchChange::Markdown)
+        );
+        assert_eq!(
+            change(
+                Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
+                    .add_path(directory.into())
+            ),
+            Some(ConfigWatchChange::Markdown)
+        );
+        assert_eq!(
+            change(modified("/cfg/config.json")),
+            Some(ConfigWatchChange::Application)
+        );
+        assert_eq!(
+            change(modified("/cfg/themes/solar.yaml")),
+            Some(ConfigWatchChange::Application)
+        );
+        assert_eq!(
+            change(
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(directory.join("study.yaml"))
+                    .add_path("/cfg/themes/study.yaml".into())
+            ),
+            Some(ConfigWatchChange::Application),
+            "a rename affecting both registries reloads both"
+        );
+        assert_eq!(change(modified("/cfg/markdown-themes/notes.txt")), None);
+        assert_eq!(change(modified("/cfg/markdown-themes/config.json")), None);
+        assert_eq!(
+            change(
+                Event::new(EventKind::Access(AccessKind::Read))
+                    .add_path(directory.join("study.yaml"))
+            ),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn markdown_only_reload_keeps_the_current_application_theme_preview(cx: &mut TestAppContext) {
+        use crate::core::markdown_theme;
+        use crate::ui::markdown_preview;
+        use gpui_component::{ActiveTheme as _, Theme, ThemeMode};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("study.yaml");
+        let yaml =
+            "schema_version: 1\nid: study\nname: Study\nlight: {}\ndark: {link: '#123456'}\n";
+        std::fs::write(&path, yaml).unwrap();
+        cx.update(|cx| {
+            let mut config = Config::default();
+            config.markdown_theme = "study".into();
+            config.theme_follow_system = false;
+            running_on(cx, config);
+            crate::ui::theme::apply_theme(None, cx);
+            assert!(
+                !cx.theme().is_dark(),
+                "the saved application theme is light"
+            );
+            markdown_preview::init(markdown_theme::scan(Some(directory.path())), cx);
+            let before = markdown_preview::current(cx);
+
+            // The application's theme picker previews a dark mode without
+            // persisting it. Saving a reading theme must not cancel that mode.
+            Theme::change(ThemeMode::Dark, None, cx);
+            let preview_background = cx.theme().background;
+            std::fs::write(&path, yaml.replace("#123456", "#abcdef")).unwrap();
+            let mut announced = true;
+            apply_watched_reload(
+                cx,
+                None,
+                markdown_theme::scan(Some(directory.path())),
+                &mut announced,
+            );
+            let after = markdown_preview::current(cx);
+            assert!(cx.theme().is_dark());
+            assert_eq!(cx.theme().background, preview_background);
+            assert_eq!(cx.global::<Config>().theme, "light");
+            assert_eq!(after.theme.id, "study");
+            assert_ne!(after.theme.dark.link, before.theme.dark.link);
+            assert!(after.revision > before.revision);
+            assert!(announced, "Markdown changes do not clear config errors");
+
+            let mut edited = cx.global::<Config>().clone();
+            bound_to_split_right(&mut edited, "ctrl-alt-9");
+            apply_watched_reload(
+                cx,
+                Some((edited, LoadOutcome::Parsed)),
+                markdown_theme::scan(Some(directory.path())),
+                &mut announced,
+            );
+            assert!(
+                !cx.theme().is_dark(),
+                "a config reload still applies the saved theme"
+            );
+            assert_eq!(
+                dispatched(cx, "ctrl-alt-9"),
+                vec![SplitRight::name_for_type()]
+            );
+            assert!(!announced);
+        });
     }
 }
 
