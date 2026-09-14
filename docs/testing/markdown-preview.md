@@ -38,6 +38,15 @@
 
 隔离源码位于 `C:/Users/cloudy/AppData/Local/Temp/tty7-markdown-verify-620fcd1d`，由基线源码和本次变更组成，不包含相邻的组件 checkout。构建复用现有 target 与 Cargo 缓存，确认 manifest、锁文件和源码无需本机路径依赖；这项验证不等同于空缓存构建或三平台 CI。
 
+## CI 回归修复
+
+2026-09-14，[首次 PR CI](https://github.com/cloudy-liu/tty7/actions/runs/34766823523) 的 Windows 构建与测试通过，macOS 和 Linux 各有一项测试失败。[定向诊断](https://github.com/cloudy-liu/tty7/actions/runs/34791560680) 复现并区分了两处原因：
+
+- macOS 的 Markdown 测试在首帧测量宽度后、宽版布局生效前建立选区。后续布局改变正文宽度，选区在切换主题之前已经清空。测试现在先完成测量与布局，再选择和滚动；通过应用入口从浅色切到深色，并在切换前后及主题文件修复重载后检查完整选区和滚动位置。
+- Linux 的终端测试同样在 `fork/main` 的 [CI](https://github.com/cloudy-liu/tty7/actions/runs/34766788704) 失败。提示符状态先于 vi 模式和结束标记到达时，渲染把暂存输入过早转入内置编辑器，导致 shell 没收到 `ls`。现在等到提示符结束标记再决定是否交给内置编辑器。回归测试主动在两批消息之间绘制一帧，保留输入送达及无残留重放的断言。
+
+Markdown 组件依赖无需更改。最新三平台全量结果见 [cloudy-liu/tty7#30 的检查页](https://github.com/cloudy-liu/tty7/pull/30/checks)；上述诊断运行仅用于定位和重复验证，不代替完整 CI。
+
 ## 尚待环境验收
 
 以下项目没有在本次环境中执行，不计为已通过：
@@ -45,7 +54,7 @@
 - Paperglow 深浅配色的原生截图对照、宽窄阅读区的视觉质量，以及 Windows 100%、125%、150%、200% DPI 抽样。
 - 实际设置界面操作、应用主题选择器预览与取消、操作系统文件监听触发的主题重载，以及退出重启后的界面检查。
 - 真实 SSH 和 SFTP 连接中的默认预览、相对图片和文件链接。
-- macOS/Linux CI 和接近 4 MiB 上限文档的实际滚动性能。
+- 接近 4 MiB 上限文档的实际滚动性能。
 
 本次会话没有可调用的 Windows 原生窗口控制运行时；当前 GPUI Windows 后端也未提供测试截图接口。自动化测试使用原生布局和文字整形，但没有生成或声称验证产品截图。
 

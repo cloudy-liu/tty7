@@ -1674,14 +1674,15 @@ mod tests {
         let (app, mut vcx) = markdown_window(cx);
         let dir = tempfile::tempdir().unwrap();
         let theme_path = dir.path().join("study.yaml");
-        let yaml =
-            "schema_version: 1\nid: study\nname: Study\nlight: {link: '#123456'}\ndark: {}\n";
+        let yaml = "schema_version: 1\nid: study\nname: Study\nlight: {link: '#123456'}\ndark: {link: '#654321'}\n";
         std::fs::write(&theme_path, yaml).unwrap();
         let host: SharedHost = tty7_core::host::local::LocalHost::new();
         let content = (0..80)
             .map(|n| format!("## Section {n}\n\nReading paragraph {n}.\n\n"))
             .collect::<String>();
         app.update_in(&mut vcx, |app, window, cx| {
+            app.set_theme_follow_system(false, window, cx);
+            app.set_preset("light", window, cx);
             crate::ui::markdown_preview::apply_snapshot(markdown_theme::scan(Some(dir.path())), cx);
             app.editor_install_file(
                 host,
@@ -1703,16 +1704,64 @@ mod tests {
                 .unwrap()
         });
         let text = reading.read_with(&vcx, |reading, _| reading.text.clone());
+        // The first frame measures the viewport; the next applies its compact
+        // or wide layout. Establish selection only after that resize, as a
+        // user does in an already visible document.
+        for _ in 0..2 {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            vcx.run_until_parked();
+        }
         text.update(&mut vcx, |text, cx| text.select_all(cx));
         reading.update(&mut vcx, |reading, cx| {
             reading.scroll.set_offset(gpui::point(px(0.), px(-300.)));
             cx.notify();
         });
         vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let selected = text.read_with(&vcx, |text, cx| {
+            assert_eq!(
+                cx.global::<gpui_component::Theme>().mode,
+                gpui_component::ThemeMode::Light
+            );
+            let selected = text.selected_text();
+            assert!(selected.contains("Section 79"));
+            selected
+        });
         let before = reading.read_with(&vcx, |reading, _| reading.scroll.offset());
+        assert!(before.y < px(0.));
         app.update_in(&mut vcx, |app, window, cx| {
             app.set_markdown_theme("study", cx);
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, Some(window), cx);
+            app.set_preset("dark", window, cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            reading.read_with(&vcx, |reading, _| reading.scroll.offset()),
+            before
+        );
+        text.read_with(&vcx, |text, cx| {
+            assert_eq!(
+                cx.global::<gpui_component::Theme>().mode,
+                gpui_component::ThemeMode::Dark
+            );
+            assert_eq!(text.source().as_ref(), content);
+            assert_eq!(text.selected_text(), selected);
+        });
+        std::fs::write(&theme_path, "invalid: [").unwrap();
+        vcx.update(|_, cx| {
+            crate::ui::markdown_preview::apply_snapshot(markdown_theme::scan(Some(dir.path())), cx);
+            assert_eq!(cx.global::<Config>().markdown_theme, "study");
+            assert_eq!(crate::ui::markdown_preview::current(cx).theme.id, "study");
+        });
+        std::fs::write(&theme_path, yaml.replace("#654321", "#abcdef")).unwrap();
+        vcx.update(|_, cx| {
+            crate::ui::markdown_preview::apply_snapshot(markdown_theme::scan(Some(dir.path())), cx)
         });
         vcx.run_until_parked();
         vcx.update(|window, cx| {
@@ -1724,19 +1773,8 @@ mod tests {
         );
         text.read_with(&vcx, |text, _| {
             assert_eq!(text.source().as_ref(), content);
-            assert!(text.selected_text().contains("Section 79"));
+            assert_eq!(text.selected_text(), selected);
         });
-        std::fs::write(&theme_path, "invalid: [").unwrap();
-        vcx.update(|_, cx| {
-            crate::ui::markdown_preview::apply_snapshot(markdown_theme::scan(Some(dir.path())), cx);
-            assert_eq!(cx.global::<Config>().markdown_theme, "study");
-            assert_eq!(crate::ui::markdown_preview::current(cx).theme.id, "study");
-        });
-        std::fs::write(&theme_path, yaml.replace("#123456", "#abcdef")).unwrap();
-        vcx.update(|_, cx| {
-            crate::ui::markdown_preview::apply_snapshot(markdown_theme::scan(Some(dir.path())), cx)
-        });
-        vcx.run_until_parked();
         app.read_with(&vcx, |app, _| {
             let file = app.tab_code().unwrap().active_file().unwrap();
             assert_eq!(
