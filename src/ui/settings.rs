@@ -2371,6 +2371,8 @@ impl Tty7App {
             .child(self.render_theme_selection(cx))
             .child(self.render_custom_themes(cx))
             .child(self.section_rule(cx))
+            .child(self.render_markdown_theme_settings(cx))
+            .child(self.section_rule(cx))
             .child(self.render_window_section(cx))
             .child(self.section_rule(cx))
             .child(self.section_header(t(L10nKey::SettingsLanguage), cx))
@@ -6097,6 +6099,99 @@ impl Tty7App {
                     .child(bar(0.1, ansi(6)))
                     .child(bar(0.32, accent)),
             )
+    }
+
+    fn render_markdown_theme_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::core::markdown_theme::Registry;
+        let selected = cx.global::<Config>().markdown_theme.clone();
+        let active = crate::ui::markdown_preview::current(cx);
+        let (entries, errors, unavailable) = match cx.try_global::<Registry>() {
+            Some(registry) => (
+                registry.entries.values().cloned().collect::<Vec<_>>(),
+                registry.errors.clone(),
+                registry.unavailable(&selected),
+            ),
+            None => (vec![active.clone()], Vec::new(), false),
+        };
+        let app = cx.entity().downgrade();
+        let label = active.theme.name.clone();
+        let menu_selected = selected.clone();
+        let picker = Button::new("markdown-theme-picker")
+            .label(label)
+            .icon(IconName::ChevronDown)
+            .small()
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+                let mut menu = menu.min_w(px(230.));
+                for entry in &entries {
+                    let id = entry.theme.id.clone();
+                    let source = if entry.source.is_none() {
+                        L10nKey::SettingsMarkdownThemeBuiltin
+                    } else {
+                        L10nKey::SettingsMarkdownThemeUser
+                    };
+                    let duplicate_name = entries
+                        .iter()
+                        .filter(|other| other.theme.name == entry.theme.name)
+                        .count()
+                        > 1;
+                    let name = if duplicate_name {
+                        format!("{} [{}]", entry.theme.name, id)
+                    } else {
+                        entry.theme.name.clone()
+                    };
+                    let app = app.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!("{} · {}", name, t(source)))
+                            .checked(id == menu_selected)
+                            .on_click(move |_, _, cx| {
+                                if let Some(app) = app.upgrade() {
+                                    app.update(cx, |this, cx| this.set_markdown_theme(&id, cx));
+                                }
+                            }),
+                    );
+                }
+                menu
+            });
+        let control = h_flex()
+            .gap_2()
+            .child(picker)
+            .child(
+                Button::new("open-markdown-themes")
+                    .label(t(L10nKey::SettingsOpenThemesFolder))
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        match crate::core::markdown_theme::open_directory() {
+                            Ok(path) => cx.open_with_system(&path),
+                            Err(error) => window.push_notification(error, cx),
+                        }
+                    })),
+            )
+            .into_any_element();
+        let mut section = v_flex().child(self.settings_row(
+            t(L10nKey::SettingsMarkdownTheme),
+            t(L10nKey::SettingsMarkdownThemeDesc),
+            control,
+            cx,
+        ));
+        if unavailable {
+            section = section.child(div().pb_2().text_sm().text_color(cx.theme().warning).child(
+                t_fmt(
+                    L10nKey::SettingsMarkdownThemeUnavailable,
+                    &[("requested", &selected), ("active", &active.theme.name)],
+                ),
+            ));
+        }
+        for (path, error) in errors {
+            section = section.child(
+                div()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(format!("{path}: {error}")),
+            );
+        }
+        section.into_any_element()
     }
 
     fn render_theme_selection(&self, cx: &mut Context<Self>) -> AnyElement {

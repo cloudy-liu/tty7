@@ -1,0 +1,90 @@
+---
+title: "Markdown 阅读主题"
+description: "默认 Paperglow 预览、主题文件、深浅配色和热加载。"
+---
+
+打开 `.md` 或 `.markdown` 文件会直接显示预览，扩展名不区分大小写。点击文档状态栏的“编辑”进入源码，再点击“预览”查看当前缓冲区，包括尚未保存的修改。两种模式共用同一个缓冲区，保留撤销历史、保存和冲突处理。
+
+默认主题是 Paperglow。预览使用应用当前实际生效的深浅模式，应用主题选择器的临时预览及取消也会同步。Markdown 阅读主题有独立的配置项，可以和任意应用主题搭配。
+
+## 安装与选择
+
+1. 打开 **设置 → 外观 → Markdown 阅读主题**。
+2. 点击该区域的“打开主题目录”。目录是当前有效配置目录下的 `markdown-themes`，使用 `--config-dir` 启动时也跟随该目录。
+3. 把 UTF-8 编码的 `.yaml` 或 `.yml` 文件直接放入目录。
+4. 在下拉菜单中选择主题。选择立即应用并保存到 `config.json` 的 `markdown_theme` 字段。
+
+只扫描目录的直接子文件，文件名不决定主题身份，文件中的 `id` 才是稳定标识。新增文件不会自动切换当前主题。
+
+## 从一个小主题开始
+
+```yaml
+schema_version: 1
+id: blue-paper
+name: 蓝色纸张
+author: Your name
+description: Paperglow 排版与蓝色链接
+license: CC0-1.0
+light:
+  link: '#2456a6'
+  link_hover: '#183f80'
+dark:
+  link: '#a1c2ff'
+  link_hover: '#c6dbff'
+```
+
+`schema_version`、`id`、`name`、`light` 和 `dark` 必填。两个配色映射都必须存在，可以用 `{}` 表示全部采用默认值。省略的字段分别从内置 Paperglow 的浅色、深色和共用排版补齐；作者、说明和许可不会继承。
+
+`id` 只能包含小写 ASCII 字母、数字、`-`、`_`，不能为空。`paperglow` 为内置主题保留。显示名称可以使用中文；同名主题会额外显示 ID。多个文件声明相同 ID 时，全部冲突文件都被排除，设置会列出来源。
+
+## 完整格式
+
+可直接复制仓库中的 [完整主题示例](https://github.com/cloudy-liu/tty7/blob/main/docs/examples/markdown-themes/blue-paper.yaml)，或参考 [Paperglow 全量默认值](https://github.com/cloudy-liu/tty7/blob/main/assets/markdown-themes/paperglow.yaml)。示例包括全部可用字段；修改后放入主题目录即可。
+
+所有尺寸均为应用缩放 100% 时的逻辑像素；行高是倍数。系统 DPI 由 GPUI 处理，无需把配置值再乘以屏幕缩放比例。
+
+| 分组 | 字段与作用 |
+|---|---|
+| `typography` | `fonts` 正文和标题字体回退列表；`code_fonts` 代码字体列表，空列表沿用应用等宽字体；`font_size`、`code_size`、`line_height`；六项 `heading_sizes`、`heading_weights`；`heading_line_height`、`paragraph_gap`、`heading_gap` |
+| `layout` | `max_width`、`compact_below`、`outer_padding`、`padding`、`compact_padding`；`radius`、`shadow_blur`、`shadow_offset`；`code_padding`、`code_radius`；`quote_padding`、`quote_border`、`quote_radius`；`table_padding`、`list_gap` |
+| `light` / `dark` 基础颜色 | `background`、`paper`、`paper_border`、`shadow`、`foreground`、`heading`、`muted`、`border`、`accent`、`link`、`link_hover`、`selection` |
+| 代码颜色 | `inline_code_background`、`inline_code_foreground`、`code_background`、`code_foreground`、`code_border` |
+| 引用颜色 | `quote_background`、`quote_foreground`、`quote_border`、`quote_link`、`quote_code_background`、`quote_code_foreground`、`nested_quote_background`、`nested_quote_border` |
+| 提示块与表格颜色 | `alert_background`、`alert_foreground`、`alert_border`、`table_code_background`、`table_hover` |
+| 每个变体中的 `syntax` | `keyword`、`number`、`function`、`variable`、`variable_special`、`type`、`comment`、`string`、`tag` |
+
+颜色接受带引号的 `#RRGGBB`、`#RRGGBBAA` 和 `rgba(r,g,b,a)`。RGBA 的 RGB 分量范围为 0–255，透明度范围为 0–1。字号、行高、宽度和断点必须是有限正数；边距、圆角等允许为零，不允许负数；标题字重范围为 100–900。
+
+未知字段、类型错误、不支持的版本、非法颜色和超过 256 KiB 的主题文件会显示为加载错误。所有字体都从本机选择，字体缺失时使用离线回退。
+
+## 热加载与恢复
+
+保存主题文件后，应用对目录事件做 200ms 防抖，再加载整份主题。浅色和深色都校验成功才发布新版本。已打开的文档会更新正文与代码颜色，保留缓冲区、当前模式、选择和阅读位置。修改字号或留白会重新排版。
+
+保存 Markdown 主题文件不会重新应用 tty7 的界面主题，因此不会打断应用主题选择器中正在试用的配色。
+
+| 情况 | 行为 |
+|---|---|
+| 当前主题文件损坏、删除或出现重复 ID | 本次运行保留最近有效的主题，设置显示错误 |
+| 启动时所选主题不可用 | 使用 Paperglow，并提示原选择不可用 |
+| 文件修复，原 ID 恢复有效 | 自动恢复，无需重新选择 |
+| 文件重命名，ID 不变 | 保留选择 |
+| 文件改为新 ID | 视为删除旧主题和安装新主题 |
+
+回退不会改写 `markdown_theme`。最近有效的主题只保留在内存中。
+
+## 阅读与导航
+
+正文支持选择、全选和复制，代码块有单独的“复制代码”按钮。方向键、Page Up、Page Down、空格、Home 和 End 可以滚动。预览持有焦点，普通输入或粘贴不会编辑隐藏的源码。明确指定行列号的文件链接会进入源码定位。
+
+支持常规 GFM、五种 GitHub 提示块，以及 README 常用 HTML 展示子集：`p`、`div` 的对齐，`br`、`img`、`a`、`strong`、`b`、`em`、`i`、`code`、`kbd`。任务项只展示状态。
+
+相对图片和文件链接使用文档所属的 Host 和父目录，本地、SSH 和 SFTP 文档采用同一路径。HTTP(S) 图片使用应用资源加载器，网页链接交给浏览器；标题链接在预览中定位，重复标题依次使用 `标题`、`标题-1` 等 ID。图片加载失败时保留替代文本，文档仍可编辑。每篇文档最多缓存 64 个同主机图片地址，单张读取上限 8 MiB，总编码缓存上限 32 MiB。
+
+## 转换 Typora CSS
+
+主题包只描述原生渲染器支持的数据。把 Typora 的正文颜色映射到 `foreground`，纸张背景映射到 `paper`，链接颜色映射到 `link`，代码语法颜色映射到 `syntax`，再把字号与留白写入共用排版。
+
+任意 CSS 选择器、脚本、网页字体、可执行插件、主题商店和多层继承不在第一版范围。Mermaid、数学公式、打印与 PDF 导出也不由阅读主题包提供。
+
+Paperglow 来自 [cloudy-liu/Paperglow-Theme](https://github.com/cloudy-liu/Paperglow-Theme) 的 Typora 版本，采用 Apache-2.0；移植来源与许可随应用保留。

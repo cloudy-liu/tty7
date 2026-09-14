@@ -75,6 +75,7 @@ Changes available only in source builds from `main` are marked **unreleased**.
 | Exact agent-session restore after server restarts, with shell fallback **(c.7)** | All | Not submitted |
 | Transparent, theme-aware avatars for all 19 agents **(c.6)** | All | Not submitted |
 | Antigravity brand icon support | All | Not submitted |
+| [Markdown default preview and configurable Paperglow reading themes](docs/customization/markdown-themes.mdx) **(unreleased)** | All | Not submitted |
 | Bell off by default | All | Fork default |
 | Update checks without the GitHub REST API | All | Fork-specific |
 | Custom `-c` release line and update channel | All | Fork-specific |

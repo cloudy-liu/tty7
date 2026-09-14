@@ -70,6 +70,7 @@ Claude Code 等 coding agent 的状态感知放在同一个应用里。
 | server 重启后精确恢复 agent 会话，无法识别时回到 shell **（c.7）** | 全平台 | 未提交上游 |
 | 19 个 agent 的透明、主题自适应头像 **（c.6）** | 全平台 | 未提交上游 |
 | Antigravity 品牌图标支持 | 全平台 | 未提交上游 |
+| [Markdown 默认预览、Paperglow 深浅配色与可配置阅读主题](docs/customization/markdown-themes.mdx) **（未发布）** | 全平台 | 未提交上游 |
 | 响铃默认关闭 | 全平台 | fork 默认值 |
 | 更新检查不走 GitHub REST API | 全平台 | 仅限 fork |
 | 客制 `-c` 发布线与更新通道 | 全平台 | 仅限 fork |

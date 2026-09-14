@@ -43,6 +43,9 @@ log.workspace = true
 # Smart double-click selection patterns (URL/email/path). Already in the tree
 # transitively, so pinning it here adds no new native code.
 regex = "1"
+# Document-relative Markdown links and URL fragments (already transitive).
+percent-encoding = "2"
+url = "2"
 # Grapheme-cluster boundaries for the sidebar's label elision
 # (`ui::tab_strip`). Cutting a label by `char` tears emoji apart: a ZWJ
 # sequence loses its joiner, `❤️` loses the variation selector that makes it an
@@ -85,6 +88,7 @@ keyring = "4"
 # plist) so the large iTerm color-scheme ecosystem drops straight in. serde_yaml
 # is already in the tree transitively, so it pins no new code; plist is pure Rust.
 serde_yaml = "0.9"
+serde_path_to_error = "0.1"
 plist = "1"
 
 # Clipboard-image paste (`terminal::view`). When the clipboard holds a screenshot
@@ -268,18 +272,18 @@ edition = "2024"
 version = "26.8.3-c.7"
 
 [workspace.dependencies]
-# Our fork's `tty7` branch carries the local customizations tty7 relies on:
-# `PopupMenu::with_size`, the 1px hairline menu separator, and the custom-button
-# label color the chrome tiles need. The exact commit is still pinned by
-# Cargo.lock. For co-developing the UI crate, point these back at a sibling
+# The maintenance fork retains tty7's existing menu, button and input changes
+# and adds instance-scoped Markdown styles, highlighting and document resources.
+# Both packages use the same commit, also recorded in Cargo.lock.
+# For co-developing the UI crate, point these back at a sibling
 # checkout: `path = "../gpui-component/crates/{ui,assets}"` — but never commit
 # that, since a path dependency can't resolve on CI.
 #
 # `tree-sitter-languages` compiles the grammars the code editor highlights with.
-gpui-component = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.2", features = [
+gpui-component = { git = "https://github.com/cloudy-liu/gpui-component", rev = "2ebbed0674739b5fc56f71bef1b4a436b08321e7", version = "0.5.2", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/l0ng-ai/gpui-component", branch = "tty7", version = "0.5.1" }
+gpui-component-assets = { git = "https://github.com/cloudy-liu/gpui-component", rev = "2ebbed0674739b5fc56f71bef1b4a436b08321e7", version = "0.5.1" }
 
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 # Base features are cross-platform (`font-kit`, `runtime_shaders` only map to the
