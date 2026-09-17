@@ -114,6 +114,23 @@ enum VersionProbe {
     Unresponsive,
 }
 
+impl VersionProbe {
+    fn startup_outcome(&self) -> Option<DaemonStartup> {
+        match self {
+            Self::Speaks(_) | Self::Legacy => Some(DaemonStartup::Reused),
+            Self::Unresponsive => None,
+        }
+    }
+}
+
+/// Whether startup kept the daemon that already owned the panes or created a
+/// new, empty daemon that needs every saved workspace to hydrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStartup {
+    Reused,
+    Spawned,
+}
+
 const DAEMON_EXE_STEMS: [&str; 3] = ["tty7-app", "tty7-server", "tty7"];
 
 fn strip_exe_suffix(name: &str) -> &str {
@@ -173,6 +190,10 @@ fn recorded_daemon_is_dead_with(recorded: Option<u32>, alive: impl Fn(u32) -> bo
     pid > 4 && pid != std::process::id() && !alive(pid)
 }
 
+fn live_recorded_daemon() -> Option<u32> {
+    pidfile::read().filter(|&pid| pid > 4 && pid != std::process::id() && daemon_process_alive(pid))
+}
+
 #[cfg(windows)]
 fn daemon_process_alive(pid: u32) -> bool {
     !crate::daemon::winproc::wait_for_exit(pid, Duration::ZERO)
@@ -191,14 +212,27 @@ fn daemon_process_alive(_pid: u32) -> bool {
 }
 
 pub fn ensure_running() -> anyhow::Result<()> {
+    ensure_running_with_outcome().map(|_| ())
+}
+
+pub fn ensure_running_with_outcome() -> anyhow::Result<DaemonStartup> {
     // A dead recorded daemon is the cheap, certain signal that the endpoint
     // files are stale: skip the connect entirely and let the cleanup below
     // clear them before the fresh daemon is spawned — the spawn poll would
     // otherwise keep paying the OS's refusal delay on the dead port.
+    // Handoff preserves the daemon pid. Capture it before any concurrent
+    // launcher can claim the seat: an answering holder with this same pid kept
+    // the panes, while a different holder is a fresh daemon that needs full
+    // workspace hydration.
+    let continuity_pid = live_recorded_daemon();
     let mut stale = recorded_daemon_is_dead();
     if !stale {
         if let Ok(mut stream) = transport::connect() {
-            match query_daemon_version(&mut stream) {
+            let probe = query_daemon_version(&mut stream);
+            let startup = probe.startup_outcome().map(|_| {
+                answering_daemon_outcome(continuity_pid, crate::daemon::singleton::holder_pid())
+            });
+            match probe {
                 VersionProbe::Speaks(v) if v.protocol == PROTOCOL_VERSION => {
                     if !v.build.is_empty() && v.build != env!("CARGO_PKG_VERSION") {
                         log::info!(
@@ -225,7 +259,7 @@ pub fn ensure_running() -> anyhow::Result<()> {
                         );
                         note_daemon_mismatch(DaemonMismatch::Dialect(refusal));
                     }
-                    return Ok(());
+                    return Ok(startup.expect("an answering daemon is reused"));
                 }
                 VersionProbe::Speaks(v) => {
                     log::warn!(
@@ -237,7 +271,7 @@ pub fn ensure_running() -> anyhow::Result<()> {
                     );
                     note_local_daemon(Some(v.clone()));
                     note_daemon_mismatch(DaemonMismatch::Protocol(Some(v)));
-                    return Ok(());
+                    return Ok(startup.expect("an answering daemon is reused"));
                 }
                 VersionProbe::Legacy => {
                     log::warn!(
@@ -245,7 +279,7 @@ pub fn ensure_running() -> anyhow::Result<()> {
                     );
                     note_local_daemon(None);
                     note_daemon_mismatch(DaemonMismatch::Protocol(None));
-                    return Ok(());
+                    return Ok(startup.expect("an answering daemon is reused"));
                 }
                 VersionProbe::Unresponsive => {
                     log::info!("daemon did not answer the version handshake; restarting it");
@@ -272,8 +306,8 @@ pub fn ensure_running() -> anyhow::Result<()> {
         }
     }
 
-    if stale {
-        reap_stranded();
+    if stale && let Some(outcome) = reap_stranded_after(continuity_pid) {
+        return Ok(outcome);
     }
 
     // While an installer is replacing the installation, spawning a daemon
@@ -307,7 +341,7 @@ pub fn ensure_running() -> anyhow::Result<()> {
                 VersionProbe::Speaks(v) => note_local_daemon(Some(v)),
                 _ => note_local_daemon(None),
             }
-            return Ok(());
+            return Ok(DaemonStartup::Spawned);
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
@@ -329,6 +363,17 @@ pub fn ensure_running() -> anyhow::Result<()> {
 /// A healthy server is the caller's to detect first — everything here acts on
 /// the premise that nobody answered.
 pub fn reap_stranded() {
+    let _ = reap_stranded_with_outcome();
+}
+
+/// Reaps an unreachable seat holder, or reports that it began answering
+/// during the handoff/startup grace period and therefore still owns its panes.
+pub fn reap_stranded_with_outcome() -> Option<DaemonStartup> {
+    let continuity_pid = live_recorded_daemon();
+    reap_stranded_after(continuity_pid)
+}
+
+fn reap_stranded_after(continuity_pid: Option<u32>) -> Option<DaemonStartup> {
     // A seat holder mid-handoff or mid-startup — claimed, not yet listening —
     // looks exactly like a stranded one from out here, and it may be carrying
     // every live session across an exec. Give it a moment to open its
@@ -342,12 +387,27 @@ pub fn reap_stranded() {
     // the reap's subject, not its exception — waiting out the rest of the
     // grace on it would only delay what its silence already decided.
 
-    if crate::daemon::singleton::holder_pid().is_some() {
+    if let Some(holder_pid) = crate::daemon::singleton::holder_pid() {
         let deadline = Instant::now() + STRANDED_GRACE;
         while Instant::now() < deadline {
             if let Ok(mut stream) = transport::connect() {
                 match query_daemon_version(&mut stream) {
-                    VersionProbe::Speaks(_) | VersionProbe::Legacy => return,
+                    VersionProbe::Speaks(version) => {
+                        note_local_daemon(Some(version));
+                        return Some(grace_answer_outcome(
+                            continuity_pid,
+                            holder_pid,
+                            crate::daemon::singleton::holder_pid(),
+                        ));
+                    }
+                    VersionProbe::Legacy => {
+                        note_local_daemon(None);
+                        return Some(grace_answer_outcome(
+                            continuity_pid,
+                            holder_pid,
+                            crate::daemon::singleton::holder_pid(),
+                        ));
+                    }
                     VersionProbe::Unresponsive => break,
                 }
             }
@@ -365,6 +425,28 @@ pub fn reap_stranded() {
     // refused-connect delay the reap above just made unnecessary.
     #[cfg(windows)]
     crate::host::server::remove_control_endpoint();
+    None
+}
+
+fn answering_daemon_outcome(continuity_pid: Option<u32>, holder_pid: Option<u32>) -> DaemonStartup {
+    match (continuity_pid, holder_pid) {
+        (Some(before), Some(now)) if before == now => DaemonStartup::Reused,
+        // Builds predating the singleton lock can still have a valid pidfile;
+        // that live record is the only continuity token available for them.
+        (Some(_), None) => DaemonStartup::Reused,
+        _ => DaemonStartup::Spawned,
+    }
+}
+
+fn grace_answer_outcome(
+    continuity_pid: Option<u32>,
+    holder_before_grace: u32,
+    holder_when_answering: Option<u32>,
+) -> DaemonStartup {
+    if holder_when_answering != Some(holder_before_grace) {
+        return DaemonStartup::Spawned;
+    }
+    answering_daemon_outcome(continuity_pid, holder_when_answering)
 }
 
 /// How long a seat holder that is not answering yet gets to be a daemon
@@ -1308,6 +1390,51 @@ mod windows_spawn_tests {
 #[cfg(test)]
 mod exe_name_tests {
     use super::*;
+
+    #[test]
+    fn only_an_answering_daemon_counts_as_reused() {
+        let speaking = VersionProbe::Speaks(DaemonVersion {
+            protocol: PROTOCOL_VERSION,
+            build: "test".into(),
+            features: Vec::new(),
+            instance: "test-instance".into(),
+        });
+        assert_eq!(speaking.startup_outcome(), Some(DaemonStartup::Reused));
+        assert_eq!(
+            VersionProbe::Legacy.startup_outcome(),
+            Some(DaemonStartup::Reused),
+            "a legacy reply still proves the pane-owning process survived"
+        );
+        assert_eq!(VersionProbe::Unresponsive.startup_outcome(), None);
+    }
+
+    #[test]
+    fn only_the_preexisting_pane_owner_surviving_the_grace_counts_as_reused() {
+        assert_eq!(
+            answering_daemon_outcome(Some(41), Some(41)),
+            DaemonStartup::Reused
+        );
+        assert_eq!(
+            answering_daemon_outcome(Some(41), Some(42)),
+            DaemonStartup::Spawned,
+            "a concurrent launcher created a fresh daemon"
+        );
+        assert_eq!(
+            answering_daemon_outcome(None, Some(42)),
+            DaemonStartup::Spawned,
+            "without a preexisting live pid, continuity is not proven"
+        );
+        assert_eq!(
+            grace_answer_outcome(Some(41), 41, Some(41)),
+            DaemonStartup::Reused,
+            "the same holder answering after the grace still owns the panes"
+        );
+        assert_eq!(
+            grace_answer_outcome(Some(41), 41, Some(42)),
+            DaemonStartup::Spawned,
+            "a new holder that takes the seat during the grace owns no old panes"
+        );
+    }
 
     #[test]
     fn every_legitimate_daemon_name_is_reapable_with_and_without_exe() {

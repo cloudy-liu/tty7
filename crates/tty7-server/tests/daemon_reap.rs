@@ -212,7 +212,11 @@ fn a_holder_that_answers_the_handshake_is_left_alone() {
     await_ready(dir);
     let waiter = collect_on_exit(child);
 
-    tty7_core::daemon::spawn::reap_stranded();
+    assert_eq!(
+        tty7_core::daemon::spawn::reap_stranded_with_outcome(),
+        Some(tty7_core::daemon::spawn::DaemonStartup::Reused),
+        "the startup caller must learn that this daemon kept pane ownership"
+    );
 
     assert!(
         unsafe { libc::kill(pid as libc::pid_t, 0) } == 0,

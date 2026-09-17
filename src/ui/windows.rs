@@ -15,6 +15,10 @@ const CASCADE_STEP: f32 = 28.0;
 
 const DEFAULT_SIZE: (f32, f32) = (1440.0, 900.0);
 
+/// Yield to the platform between restored background windows so the foreground
+/// can paint and receive input before a large recovery set is constructed.
+const STARTUP_WINDOW_STAGGER: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// The smallest window tty7 still holds its shape in.
 ///
 /// Below this the chrome stops being chrome: the sidebar is at its 180px floor
@@ -231,19 +235,33 @@ pub fn open_at(
     workspace: Option<WorkspaceId>,
     initial_cwd: Option<std::path::PathBuf>,
 ) {
+    let _ = open_at_with_disposition(cx, workspace, initial_cwd, OpenDisposition::Normal);
+}
+
+fn open_at_with_disposition(
+    cx: &mut App,
+    workspace: Option<WorkspaceId>,
+    initial_cwd: Option<std::path::PathBuf>,
+    disposition: OpenDisposition,
+) -> bool {
     if let Some(id) = workspace
         && let Some(handle) = WindowRegistry::window_for(cx, id)
     {
-        let _ = handle.update(cx, |_, window, _| window.activate_window());
-        return;
+        if disposition != OpenDisposition::RestoreBackground {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        }
+        return true;
     }
 
-    let options = window_options(cx, workspace);
+    let options = window_options(cx, workspace, disposition);
     let mut created: Option<gpui::Entity<Tty7App>> = None;
     let opened = cx.open_window(options, |window, cx| {
-        let app = cx.new(|cx| match initial_cwd.clone() {
-            Some(cwd) => Tty7App::for_workspace_at(workspace, Some(cwd), window, cx),
-            None => Tty7App::for_workspace(workspace, window, cx),
+        let app = cx.new(|cx| match (disposition, workspace, initial_cwd.clone()) {
+            (OpenDisposition::RestoreBackground, Some(id), _) => {
+                Tty7App::for_workspace_in_background(id, window, cx)
+            }
+            (_, _, Some(cwd)) => Tty7App::for_workspace_at(workspace, Some(cwd), window, cx),
+            _ => Tty7App::for_workspace(workspace, window, cx),
         });
         created = Some(app.clone());
         cx.new(|cx| Root::new(app, window, cx).bg(gpui::transparent_black()))
@@ -253,17 +271,18 @@ pub fn open_at(
         Ok(handle) => handle,
         Err(e) => {
             log::error!("failed to open window: {e}");
-            return;
+            return false;
         }
     };
     let Some(app) = created else {
         log::error!("opened a window but its Tty7App was never built; not registering");
-        return;
+        return false;
     };
 
     let id = app.read(cx).workspace;
     WindowRegistry::register(cx, id, handle.into(), app.downgrade());
     refresh_menu(cx);
+    true
 }
 
 /// A named workspace is the one that gets the window: the CLI made it, knows
@@ -310,6 +329,231 @@ pub fn open_from_cli(cx: &mut App, path: Option<std::path::PathBuf>) {
 /// restore left detached. Their panes are still running — the count exists so
 /// the launch can say so instead of letting them be forgotten (#597).
 pub type RestoreTarget = (WorkspaceId, usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenDisposition {
+    Normal,
+    RestoreForeground,
+    RestoreBackground,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupWindow {
+    pub workspace: Option<WorkspaceId>,
+    pub initial_cwd: Option<std::path::PathBuf>,
+    pub disposition: OpenDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupPlan {
+    pub windows: Vec<StartupWindow>,
+    pub detached: Option<RestoreTarget>,
+}
+
+pub(crate) fn restore_at_launch_with(
+    cx: &mut App,
+    daemon: impl Into<Option<tty7_core::daemon::spawn::DaemonStartup>>,
+    restore_session: bool,
+    path: Option<std::path::PathBuf>,
+    open: impl FnOnce(&mut App, StartupPlan),
+) {
+    use tty7_core::daemon::spawn::DaemonStartup;
+    let daemon = daemon.into();
+
+    let plan = if !restore_session {
+        WorkspaceStore::close_all_for_launch(cx);
+        StartupPlan {
+            windows: vec![StartupWindow {
+                workspace: None,
+                initial_cwd: path,
+                disposition: OpenDisposition::RestoreForeground,
+            }],
+            detached: None,
+        }
+    } else {
+        match daemon {
+            Some(DaemonStartup::Reused) => {
+                let restored = restore_target(cx, path.as_deref());
+                StartupPlan {
+                    windows: vec![StartupWindow {
+                        workspace: restored.map(|(id, _)| id),
+                        initial_cwd: path,
+                        disposition: OpenDisposition::RestoreForeground,
+                    }],
+                    detached: restored,
+                }
+            }
+            Some(DaemonStartup::Spawned) => {
+                let views = WorkspaceStore::all(cx);
+                let foreground = startup_foreground(views, path.is_some());
+                let mut windows = vec![StartupWindow {
+                    workspace: foreground,
+                    initial_cwd: path,
+                    disposition: OpenDisposition::RestoreForeground,
+                }];
+                let mut background = views
+                    .open_views()
+                    .filter(|view| Some(view.id) != foreground)
+                    .collect::<Vec<_>>();
+                background.sort_by_key(|view| std::cmp::Reverse(view.last_active));
+                windows.extend(background.into_iter().map(|view| StartupWindow {
+                    workspace: Some(view.id),
+                    initial_cwd: None,
+                    disposition: OpenDisposition::RestoreBackground,
+                }));
+                StartupPlan {
+                    windows,
+                    detached: None,
+                }
+            }
+            None => {
+                // No answering daemon means there is no evidence that detached
+                // panes survived and no successful spawn that could hydrate all
+                // windows. Open one conservatively without mutating the saved
+                // open set, so a later successful launch can still recover it.
+                let workspace = startup_foreground(WorkspaceStore::all(cx), path.is_some());
+                StartupPlan {
+                    windows: vec![StartupWindow {
+                        workspace,
+                        initial_cwd: path,
+                        disposition: OpenDisposition::RestoreForeground,
+                    }],
+                    detached: None,
+                }
+            }
+        }
+    };
+    open(cx, plan);
+}
+
+pub fn restore_at_launch(
+    cx: &mut App,
+    daemon: Option<tty7_core::daemon::spawn::DaemonStartup>,
+    restore_session: bool,
+    path: Option<std::path::PathBuf>,
+) {
+    restore_at_launch_with(cx, daemon, restore_session, path, |cx, plan| {
+        let detached = plan.detached;
+        open_startup_plan_with(cx, plan, |cx, request| {
+            open_startup_window_with(cx, request, |cx, request| {
+                open_at_with_disposition(
+                    cx,
+                    request.workspace,
+                    request.initial_cwd,
+                    request.disposition,
+                )
+            })
+        });
+        announce_detached_at_launch(cx, detached);
+    });
+}
+
+fn open_startup_plan_with<F>(cx: &mut App, plan: StartupPlan, open: F)
+where
+    F: FnMut(&mut App, StartupWindow) -> bool + 'static,
+{
+    let mut windows = std::collections::VecDeque::from(plan.windows);
+    let Some(foreground) = windows.pop_front() else {
+        return;
+    };
+    let mut open = open;
+    let mut pending_initial_cwd = foreground.initial_cwd.clone();
+    let mut needs_foreground = !open(cx, foreground);
+    if !needs_foreground {
+        pending_initial_cwd = None;
+    }
+    if windows.is_empty() && pending_initial_cwd.is_none() {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        while let Some(mut next) = windows.pop_front() {
+            cx.background_executor().timer(STARTUP_WINDOW_STAGGER).await;
+            cx.update(|cx| {
+                if !startup_window_is_still_requested(cx, &next) {
+                    return;
+                }
+                let promote = needs_foreground
+                    && (pending_initial_cwd.is_none() || startup_window_is_local(cx, &next));
+                if promote {
+                    next.disposition = OpenDisposition::RestoreForeground;
+                    next.initial_cwd = pending_initial_cwd.take();
+                }
+                let retry_cwd = next.initial_cwd.clone();
+                let opened = open(cx, next);
+                if promote {
+                    needs_foreground = !opened;
+                    if !opened {
+                        pending_initial_cwd = retry_cwd;
+                    }
+                }
+            });
+        }
+        if needs_foreground && pending_initial_cwd.is_some() {
+            cx.background_executor().timer(STARTUP_WINDOW_STAGGER).await;
+            cx.update(|cx| {
+                let _ = open(
+                    cx,
+                    StartupWindow {
+                        workspace: None,
+                        initial_cwd: pending_initial_cwd.take(),
+                        disposition: OpenDisposition::RestoreForeground,
+                    },
+                );
+            });
+        }
+    })
+    .detach();
+}
+
+fn startup_window_is_still_requested(cx: &App, request: &StartupWindow) -> bool {
+    match request.workspace {
+        None => true,
+        Some(workspace) => WorkspaceStore::all(cx)
+            .get(workspace)
+            .is_some_and(|view| view.open),
+    }
+}
+
+fn startup_window_is_local(cx: &App, request: &StartupWindow) -> bool {
+    match request.workspace {
+        None => true,
+        Some(workspace) => WorkspaceStore::all(cx)
+            .get(workspace)
+            .is_some_and(|view| !view.is_remote()),
+    }
+}
+
+fn open_startup_window_with(
+    cx: &mut App,
+    request: StartupWindow,
+    open: impl FnOnce(&mut App, StartupWindow) -> bool,
+) -> bool {
+    let workspace = request.workspace;
+    let opened = open(cx, request);
+    if !opened && let Some(workspace) = workspace {
+        WorkspaceStore::mark_restore_open_failed(cx, workspace);
+    }
+    opened
+}
+
+fn startup_foreground(
+    views: &crate::core::session::WindowViews,
+    requires_local: bool,
+) -> Option<WorkspaceId> {
+    let eligible = |view: &crate::core::session::WindowView| {
+        view.open && (!requires_local || !view.is_remote())
+    };
+    views
+        .active
+        .filter(|id| views.get(*id).is_some_and(&eligible))
+        .or_else(|| {
+            views
+                .open_views()
+                .filter(|view| eligible(view))
+                .max_by_key(|view| view.last_active)
+                .map(|view| view.id)
+        })
+}
 
 /// The workspace a launch reopens, if any.
 ///
@@ -661,7 +905,11 @@ fn close_window_for(cx: &mut App, workspace: WorkspaceId) {
     });
 }
 
-fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions {
+fn window_options(
+    cx: &mut App,
+    workspace: Option<WorkspaceId>,
+    disposition: OpenDisposition,
+) -> WindowOptions {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     static APP_ICON: std::sync::LazyLock<Option<std::sync::Arc<image::RgbaImage>>> =
         std::sync::LazyLock::new(|| {
@@ -678,6 +926,7 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
                 .or_else(WindowState::load)
         })
         .flatten();
+    let has_remembered_bounds = remembered.is_some();
 
     let existing = WindowRegistry::count(cx);
     let bounds = match remembered {
@@ -691,10 +940,12 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
         }
         None => Bounds::centered(None, size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx),
     };
-    let bounds = cascade(bounds, existing);
+    let bounds = bounds_for_disposition(bounds, existing, disposition);
 
     let window_bounds = match cx.global::<Config>().startup_mode {
-        _ if existing > 0 => WindowBounds::Windowed(bounds),
+        _ if existing > 0 || (has_remembered_bounds && disposition != OpenDisposition::Normal) => {
+            WindowBounds::Windowed(bounds)
+        }
         StartupMode::Normal => WindowBounds::Windowed(bounds),
         StartupMode::Maximized => WindowBounds::Maximized(bounds),
         StartupMode::Fullscreen => WindowBounds::Fullscreen(bounds),
@@ -717,7 +968,20 @@ fn window_options(cx: &mut App, workspace: Option<WorkspaceId>) -> WindowOptions
         window_decorations: Some(WindowDecorations::Client),
         window_background: crate::ui::theme::background_appearance(cx),
         window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
+        focus: disposition != OpenDisposition::RestoreBackground,
+        show: true,
         ..Default::default()
+    }
+}
+
+fn bounds_for_disposition(
+    bounds: Bounds<gpui::Pixels>,
+    existing: usize,
+    disposition: OpenDisposition,
+) -> Bounds<gpui::Pixels> {
+    match disposition {
+        OpenDisposition::Normal => cascade(bounds, existing),
+        OpenDisposition::RestoreForeground | OpenDisposition::RestoreBackground => bounds,
     }
 }
 
@@ -830,11 +1094,65 @@ mod tests {
             config.remember_window_size = false;
             cx.set_global(config);
 
-            let options = window_options(cx, None);
+            let options = window_options(cx, None, OpenDisposition::Normal);
             assert_eq!(options.window_decorations, Some(WindowDecorations::Client));
             assert!(
                 options.titlebar.is_some_and(|t| t.appears_transparent),
                 "the in-app title bar is what the client-side request stands in for"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_restore_is_visible_unfocused_and_does_not_cascade_saved_geometry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            WindowRegistry::init(cx);
+            let mut config = Config::default();
+            config.remember_window_size = true;
+            config.startup_mode = StartupMode::Maximized;
+            cx.set_global(config);
+
+            let mut view = WindowView::default();
+            let id = view.id;
+            view.window = Some(WindowState {
+                x: 100.0,
+                y: 100.0,
+                width: 800.0,
+                height: 600.0,
+            });
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![view],
+                    active: Some(id),
+                },
+            );
+
+            let options = window_options(cx, Some(id), OpenDisposition::RestoreBackground);
+            assert!(options.show, "restored workspaces are real visible windows");
+            assert!(
+                !options.focus,
+                "background recovery must not steal typing focus"
+            );
+            assert!(
+                matches!(options.window_bounds, Some(WindowBounds::Windowed(_))),
+                "saved restoration geometry takes precedence over generic startup mode"
+            );
+            assert_eq!(
+                options.window_bounds.map(|bounds| bounds.get_bounds()),
+                Some(bounds_at(100.0, 100.0)),
+                "saved placement is used exactly"
+            );
+            assert_eq!(
+                bounds_for_disposition(
+                    bounds_at(100.0, 100.0),
+                    2,
+                    OpenDisposition::RestoreBackground
+                ),
+                bounds_at(100.0, 100.0),
+                "restoration never applies the ordinary new-window cascade"
             );
         });
     }
@@ -861,6 +1179,888 @@ mod tests {
         });
 
         assert_eq!(opened, Some((Some(restored), None)));
+    }
+
+    #[gpui::test]
+    fn a_new_daemon_restores_every_window_with_the_active_one_first(cx: &mut gpui::TestAppContext) {
+        let first = WindowView::default();
+        let active = WindowView::default();
+        let last = WindowView::default();
+        let (first_id, active_id, last_id) = (first.id, active.id, last.id);
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![first, active, last],
+                    active: Some(active_id),
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                true,
+                None,
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        let plan = planned.expect("startup produces a window plan");
+        assert_eq!(
+            plan.windows,
+            vec![
+                StartupWindow {
+                    workspace: Some(active_id),
+                    initial_cwd: None,
+                    disposition: OpenDisposition::RestoreForeground,
+                },
+                StartupWindow {
+                    workspace: Some(first_id),
+                    initial_cwd: None,
+                    disposition: OpenDisposition::RestoreBackground,
+                },
+                StartupWindow {
+                    workspace: Some(last_id),
+                    initial_cwd: None,
+                    disposition: OpenDisposition::RestoreBackground,
+                },
+            ]
+        );
+        assert_eq!(plan.detached, None);
+        cx.update(|cx| {
+            assert!(
+                WorkspaceStore::all(cx).open_views().all(|view| view.open),
+                "a new daemon needs every formerly open workspace to hydrate"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_reused_daemon_keeps_the_single_window_policy(cx: &mut gpui::TestAppContext) {
+        let first = WindowView::default();
+        let active = WindowView::default();
+        let last = WindowView::default();
+        let (first_id, active_id, last_id) = (first.id, active.id, last.id);
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![first, active, last],
+                    active: Some(active_id),
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Reused,
+                true,
+                None,
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        let plan = planned.expect("startup produces a window plan");
+        assert_eq!(
+            plan.windows,
+            vec![StartupWindow {
+                workspace: Some(active_id),
+                initial_cwd: None,
+                disposition: OpenDisposition::RestoreForeground,
+            }]
+        );
+        assert_eq!(plan.detached, Some((active_id, 2)));
+        cx.update(|cx| {
+            let views = WorkspaceStore::all(cx);
+            assert!(views.get(active_id).is_some_and(|view| view.open));
+            assert!(views.get(first_id).is_some_and(|view| !view.open));
+            assert!(views.get(last_id).is_some_and(|view| !view.open));
+        });
+    }
+
+    #[gpui::test]
+    fn a_daemon_startup_failure_neither_detaches_nor_claims_other_workspaces_are_served(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let first = WindowView::default();
+        let active = WindowView::default();
+        let (first_id, active_id) = (first.id, active.id);
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![first, active],
+                    active: Some(active_id),
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                Option::<tty7_core::daemon::spawn::DaemonStartup>::None,
+                true,
+                None,
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        let plan = planned.expect("startup produces a conservative window plan");
+        assert_eq!(plan.windows.len(), 1);
+        assert_eq!(plan.windows[0].workspace, Some(active_id));
+        assert_eq!(plan.detached, None, "continuity was not proven");
+        cx.update(|cx| {
+            let views = WorkspaceStore::all(cx);
+            assert!(views.get(first_id).is_some_and(|view| view.open));
+            assert!(views.get(active_id).is_some_and(|view| view.open));
+        });
+    }
+
+    #[gpui::test]
+    fn disabling_restore_opens_fresh_and_leaves_saved_workspaces_closed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let first = WindowView::default();
+        let second = WindowView::default();
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![first, second],
+                    active: None,
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                false,
+                None,
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        let plan = planned.expect("startup produces a window plan");
+        assert_eq!(
+            plan.windows,
+            vec![StartupWindow {
+                workspace: None,
+                initial_cwd: None,
+                disposition: OpenDisposition::RestoreForeground,
+            }]
+        );
+        assert_eq!(plan.detached, None);
+        cx.update(|cx| {
+            assert_eq!(WorkspaceStore::all(cx).open_views().count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn a_directory_uses_a_local_foreground_and_still_restores_remote_windows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut local = WindowView::default();
+        local.last_active = 10;
+        let remote = WindowView::on_remote(RemoteRef::new(
+            RemoteTarget::Wsl {
+                distro: "Ubuntu".into(),
+            },
+            WorkspaceId::new(),
+        ));
+        let (local_id, remote_id) = (local.id, remote.id);
+        let path = std::path::PathBuf::from("/tmp/project");
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![local, remote],
+                    active: Some(remote_id),
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                true,
+                Some(path.clone()),
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        assert_eq!(
+            planned.expect("startup produces a window plan").windows,
+            vec![
+                StartupWindow {
+                    workspace: Some(local_id),
+                    initial_cwd: Some(path),
+                    disposition: OpenDisposition::RestoreForeground,
+                },
+                StartupWindow {
+                    workspace: Some(remote_id),
+                    initial_cwd: None,
+                    disposition: OpenDisposition::RestoreBackground,
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_new_daemon_does_not_reopen_workspaces_closed_before_the_crash(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut closed = WindowView::default();
+        closed.open = false;
+        let open = WindowView::default();
+        let open_id = open.id;
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![closed, open],
+                    active: None,
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                true,
+                None,
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        assert_eq!(
+            planned.expect("startup produces a window plan").windows,
+            vec![StartupWindow {
+                workspace: Some(open_id),
+                initial_cwd: None,
+                disposition: OpenDisposition::RestoreForeground,
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn a_new_daemon_falls_back_to_the_most_recent_open_workspace(cx: &mut gpui::TestAppContext) {
+        let mut older = WindowView::default();
+        older.last_active = 10;
+        let mut newest = WindowView::default();
+        newest.last_active = 20;
+        let newest_id = newest.id;
+        let closed_active = {
+            let mut view = WindowView::default();
+            view.open = false;
+            view
+        };
+        let closed_id = closed_active.id;
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![older, newest, closed_active],
+                    active: Some(closed_id),
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                true,
+                None,
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        assert_eq!(
+            planned.expect("startup produces a window plan").windows[0].workspace,
+            Some(newest_id)
+        );
+    }
+
+    #[gpui::test]
+    fn no_saved_open_workspace_keeps_the_fresh_window_behavior(cx: &mut gpui::TestAppContext) {
+        let mut closed = WindowView::default();
+        closed.open = false;
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![closed],
+                    active: None,
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                true,
+                None,
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        assert_eq!(
+            planned.expect("startup produces a window plan").windows,
+            vec![StartupWindow {
+                workspace: None,
+                initial_cwd: None,
+                disposition: OpenDisposition::RestoreForeground,
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn a_directory_gets_a_fresh_local_foreground_when_only_remote_windows_were_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let remote = WindowView::on_remote(RemoteRef::new(
+            RemoteTarget::Wsl {
+                distro: "Ubuntu".into(),
+            },
+            WorkspaceId::new(),
+        ));
+        let remote_id = remote.id;
+        let path = std::path::PathBuf::from("/tmp/project");
+        let mut planned = None;
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![remote],
+                    active: Some(remote_id),
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                true,
+                Some(path.clone()),
+                |_, plan| planned = Some(plan),
+            );
+        });
+
+        assert_eq!(
+            planned.expect("startup produces a window plan").windows,
+            vec![
+                StartupWindow {
+                    workspace: None,
+                    initial_cwd: Some(path),
+                    disposition: OpenDisposition::RestoreForeground,
+                },
+                StartupWindow {
+                    workspace: Some(remote_id),
+                    initial_cwd: None,
+                    disposition: OpenDisposition::RestoreBackground,
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn background_restore_is_staged_and_continues_after_a_window_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let first = WorkspaceId::new();
+        let broken = WorkspaceId::new();
+        let last = WorkspaceId::new();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let opened_by_callback = opened.clone();
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![
+                        WindowView {
+                            id: first,
+                            ..WindowView::default()
+                        },
+                        WindowView {
+                            id: broken,
+                            ..WindowView::default()
+                        },
+                        WindowView {
+                            id: last,
+                            ..WindowView::default()
+                        },
+                    ],
+                    active: Some(first),
+                },
+            );
+            open_startup_plan_with(
+                cx,
+                StartupPlan {
+                    windows: vec![
+                        StartupWindow {
+                            workspace: Some(first),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreForeground,
+                        },
+                        StartupWindow {
+                            workspace: Some(broken),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreBackground,
+                        },
+                        StartupWindow {
+                            workspace: Some(last),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreBackground,
+                        },
+                    ],
+                    detached: None,
+                },
+                move |cx, request| {
+                    open_startup_window_with(cx, request, |_, request| {
+                        opened_by_callback.borrow_mut().push(request.workspace);
+                        request.workspace != Some(broken)
+                    })
+                },
+            );
+            assert_eq!(
+                opened.borrow().as_slice(),
+                &[Some(first)],
+                "only the foreground opens in the initial effect cycle"
+            );
+        });
+
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[Some(first)],
+            "returning from the initial update is still before the first scheduler wake"
+        );
+
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[Some(first), Some(broken)],
+            "one scheduler wake opens exactly one background window"
+        );
+        cx.update(|cx| {
+            assert!(
+                WorkspaceStore::all(cx)
+                    .get(broken)
+                    .is_some_and(|view| !view.open),
+                "a failed restore is not left open without a registered window"
+            );
+        });
+
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[Some(first), Some(broken), Some(last)],
+            "a failed background open does not cancel later workspaces"
+        );
+    }
+
+    #[gpui::test]
+    fn staged_restore_skips_workspaces_closed_or_removed_before_their_wake(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let foreground = WorkspaceId::new();
+        let closed = WorkspaceId::new();
+        let removed = WorkspaceId::new();
+        let remaining = WorkspaceId::new();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let opened_by_callback = opened.clone();
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: [foreground, closed, removed, remaining]
+                        .into_iter()
+                        .map(|id| WindowView {
+                            id,
+                            ..WindowView::default()
+                        })
+                        .collect(),
+                    active: Some(foreground),
+                },
+            );
+            open_startup_plan_with(
+                cx,
+                StartupPlan {
+                    windows: [
+                        (foreground, OpenDisposition::RestoreForeground),
+                        (closed, OpenDisposition::RestoreBackground),
+                        (removed, OpenDisposition::RestoreBackground),
+                        (remaining, OpenDisposition::RestoreBackground),
+                    ]
+                    .into_iter()
+                    .map(|(workspace, disposition)| StartupWindow {
+                        workspace: Some(workspace),
+                        initial_cwd: None,
+                        disposition,
+                    })
+                    .collect(),
+                    detached: None,
+                },
+                move |_, request| {
+                    opened_by_callback.borrow_mut().push(request.workspace);
+                    true
+                },
+            );
+            WorkspaceStore::close_window(cx, closed);
+            WorkspaceStore::remove(cx, removed);
+        });
+
+        for _ in 0..2 {
+            cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+            cx.run_until_parked();
+            assert_eq!(
+                opened.borrow().as_slice(),
+                &[Some(foreground)],
+                "a stale delayed request must not resurrect its workspace"
+            );
+        }
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[Some(foreground), Some(remaining)],
+            "valid later workspaces still restore after stale requests are skipped"
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_foreground_promotes_the_next_workspace(cx: &mut gpui::TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let failed = WorkspaceId::new();
+        let fallback = WorkspaceId::new();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let opened_by_callback = opened.clone();
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![
+                        WindowView {
+                            id: failed,
+                            ..WindowView::default()
+                        },
+                        WindowView {
+                            id: fallback,
+                            ..WindowView::default()
+                        },
+                    ],
+                    active: Some(failed),
+                },
+            );
+            open_startup_plan_with(
+                cx,
+                StartupPlan {
+                    windows: vec![
+                        StartupWindow {
+                            workspace: Some(failed),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreForeground,
+                        },
+                        StartupWindow {
+                            workspace: Some(fallback),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreBackground,
+                        },
+                    ],
+                    detached: None,
+                },
+                move |cx, request| {
+                    open_startup_window_with(cx, request, |cx, request| {
+                        opened_by_callback
+                            .borrow_mut()
+                            .push((request.workspace, request.disposition));
+                        if request.workspace == Some(failed) {
+                            false
+                        } else {
+                            WorkspaceStore::claim(cx, request.workspace);
+                            true
+                        }
+                    })
+                },
+            );
+        });
+
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[(Some(failed), OpenDisposition::RestoreForeground)]
+        );
+        cx.update(|cx| {
+            assert_eq!(WorkspaceStore::all(cx).active, None);
+        });
+
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[
+                (Some(failed), OpenDisposition::RestoreForeground),
+                (Some(fallback), OpenDisposition::RestoreForeground),
+            ],
+            "the next viable workspace becomes the focused window"
+        );
+        cx.update(|cx| {
+            assert_eq!(WorkspaceStore::all(cx).active, Some(fallback));
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_active_workspace_promotes_the_most_recent_remaining_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let failed = WorkspaceId::new();
+        let older = WorkspaceId::new();
+        let newest = WorkspaceId::new();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let opened_by_callback = opened.clone();
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![
+                        WindowView {
+                            id: failed,
+                            last_active: 30,
+                            ..WindowView::default()
+                        },
+                        WindowView {
+                            id: older,
+                            last_active: 10,
+                            ..WindowView::default()
+                        },
+                        WindowView {
+                            id: newest,
+                            last_active: 20,
+                            ..WindowView::default()
+                        },
+                    ],
+                    active: Some(failed),
+                },
+            );
+            restore_at_launch_with(
+                cx,
+                tty7_core::daemon::spawn::DaemonStartup::Spawned,
+                true,
+                None,
+                move |cx, plan| {
+                    open_startup_plan_with(cx, plan, move |cx, request| {
+                        open_startup_window_with(cx, request, |cx, request| {
+                            opened_by_callback
+                                .borrow_mut()
+                                .push((request.workspace, request.disposition));
+                            if request.workspace == Some(failed) {
+                                false
+                            } else {
+                                WorkspaceStore::claim(cx, request.workspace);
+                                true
+                            }
+                        })
+                    });
+                },
+            );
+        });
+
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[
+                (Some(failed), OpenDisposition::RestoreForeground),
+                (Some(newest), OpenDisposition::RestoreForeground),
+            ],
+            "recency, not persistence order, chooses the fallback foreground"
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_path_foreground_keeps_remotes_background_and_carries_the_path_to_local(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let failed = WorkspaceId::new();
+        let remote = WindowView::on_remote(RemoteRef::new(
+            RemoteTarget::Wsl {
+                distro: "Ubuntu".into(),
+            },
+            WorkspaceId::new(),
+        ));
+        let remote_id = remote.id;
+        let local = WorkspaceId::new();
+        let path = std::path::PathBuf::from("/tmp/project");
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let opened_by_callback = opened.clone();
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![
+                        WindowView {
+                            id: failed,
+                            ..WindowView::default()
+                        },
+                        remote,
+                        WindowView {
+                            id: local,
+                            ..WindowView::default()
+                        },
+                    ],
+                    active: Some(failed),
+                },
+            );
+            open_startup_plan_with(
+                cx,
+                StartupPlan {
+                    windows: vec![
+                        StartupWindow {
+                            workspace: Some(failed),
+                            initial_cwd: Some(path.clone()),
+                            disposition: OpenDisposition::RestoreForeground,
+                        },
+                        StartupWindow {
+                            workspace: Some(remote_id),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreBackground,
+                        },
+                        StartupWindow {
+                            workspace: Some(local),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreBackground,
+                        },
+                    ],
+                    detached: None,
+                },
+                move |cx, request| {
+                    open_startup_window_with(cx, request, |_, request| {
+                        let failed_to_open = request.workspace == Some(failed);
+                        opened_by_callback.borrow_mut().push(request);
+                        !failed_to_open
+                    })
+                },
+            );
+        });
+
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[
+                StartupWindow {
+                    workspace: Some(failed),
+                    initial_cwd: Some(path.clone()),
+                    disposition: OpenDisposition::RestoreForeground,
+                },
+                StartupWindow {
+                    workspace: Some(remote_id),
+                    initial_cwd: None,
+                    disposition: OpenDisposition::RestoreBackground,
+                },
+                StartupWindow {
+                    workspace: Some(local),
+                    initial_cwd: Some(path),
+                    disposition: OpenDisposition::RestoreForeground,
+                },
+            ],
+            "the explicit local directory survives foreground failure"
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_path_foreground_creates_a_fresh_local_fallback_after_remote_restores(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let failed = WorkspaceId::new();
+        let remote = WindowView::on_remote(RemoteRef::new(
+            RemoteTarget::Wsl {
+                distro: "Ubuntu".into(),
+            },
+            WorkspaceId::new(),
+        ));
+        let remote_id = remote.id;
+        let path = std::path::PathBuf::from("/tmp/project");
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let opened_by_callback = opened.clone();
+
+        cx.update(|cx| {
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![
+                        WindowView {
+                            id: failed,
+                            ..WindowView::default()
+                        },
+                        remote,
+                    ],
+                    active: Some(failed),
+                },
+            );
+            open_startup_plan_with(
+                cx,
+                StartupPlan {
+                    windows: vec![
+                        StartupWindow {
+                            workspace: Some(failed),
+                            initial_cwd: Some(path.clone()),
+                            disposition: OpenDisposition::RestoreForeground,
+                        },
+                        StartupWindow {
+                            workspace: Some(remote_id),
+                            initial_cwd: None,
+                            disposition: OpenDisposition::RestoreBackground,
+                        },
+                    ],
+                    detached: None,
+                },
+                move |cx, request| {
+                    open_startup_window_with(cx, request, |_, request| {
+                        let failed_to_open = request.workspace == Some(failed);
+                        opened_by_callback.borrow_mut().push(request);
+                        !failed_to_open
+                    })
+                },
+            );
+        });
+
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        cx.executor().advance_clock(STARTUP_WINDOW_STAGGER);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().last(),
+            Some(&StartupWindow {
+                workspace: None,
+                initial_cwd: Some(path),
+                disposition: OpenDisposition::RestoreForeground,
+            }),
+            "without another saved local workspace, the path gets a fresh local window"
+        );
     }
 
     #[gpui::test]
