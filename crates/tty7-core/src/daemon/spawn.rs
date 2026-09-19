@@ -230,13 +230,18 @@ pub fn ensure_running_with_outcome() -> anyhow::Result<DaemonStartup> {
     // launcher can claim the seat: an answering holder with this same pid kept
     // the panes, while a different holder is a fresh daemon that needs full
     // workspace hydration.
+    let endpoint_existed = transport::endpoint_exists();
     let continuity_pid = preexisting_daemon_pid();
     let mut stale = recorded_daemon_is_dead();
     if !stale {
         if let Ok(mut stream) = transport::connect() {
             let probe = query_daemon_version(&mut stream);
             let startup = probe.startup_outcome().map(|_| {
-                initial_answer_outcome(continuity_pid, crate::daemon::singleton::holder_pid())
+                initial_answer_outcome(
+                    continuity_pid,
+                    crate::daemon::singleton::holder_pid(),
+                    endpoint_existed,
+                )
             });
             match probe {
                 VersionProbe::Speaks(v) if v.protocol == PROTOCOL_VERSION => {
@@ -444,12 +449,20 @@ fn answering_daemon_outcome(continuity_pid: Option<u32>, holder_pid: Option<u32>
     }
 }
 
-fn initial_answer_outcome(continuity_pid: Option<u32>, holder_pid: Option<u32>) -> DaemonStartup {
-    // This handshake completed before this launcher tried to spawn a daemon.
-    // Without a PID record (or, on Windows, a readable singleton holder), the
-    // answering daemon is still the one this launch found already running.
+fn initial_answer_outcome(
+    continuity_pid: Option<u32>,
+    holder_pid: Option<u32>,
+    endpoint_existed: bool,
+) -> DaemonStartup {
+    // With no readable PID, a preexisting endpoint and an answered handshake
+    // are the only continuity evidence available on Windows. If the endpoint
+    // appeared after startup began, another launcher may have spawned it.
     if continuity_pid.is_none() {
-        DaemonStartup::Reused
+        if endpoint_existed {
+            DaemonStartup::Reused
+        } else {
+            DaemonStartup::Spawned
+        }
     } else {
         answering_daemon_outcome(continuity_pid, holder_pid)
     }
@@ -1437,14 +1450,19 @@ mod exe_name_tests {
             "a concurrent launcher created a fresh daemon"
         );
         assert_eq!(
-            initial_answer_outcome(None, Some(42)),
+            initial_answer_outcome(None, Some(42), true),
             DaemonStartup::Reused,
             "an already-answering daemon is reused even when its pidfile is missing"
         );
         assert_eq!(
-            initial_answer_outcome(None, None),
+            initial_answer_outcome(None, None, true),
             DaemonStartup::Reused,
             "Windows cannot read a singleton holder but can still connect to a live daemon"
+        );
+        assert_eq!(
+            initial_answer_outcome(None, None, false),
+            DaemonStartup::Spawned,
+            "an endpoint that appeared after startup may belong to a new daemon"
         );
         assert_eq!(
             answering_daemon_outcome(None, Some(42)),
