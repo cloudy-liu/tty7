@@ -134,6 +134,24 @@ impl CLIAgent {
         }
     }
 
+    /// A plain interactive launch, with no prompt, history selector or fork.
+    /// Reopening it is only valid while the pane has received no agent input.
+    pub fn unstarted_command(self, argv: &[String]) -> Option<String> {
+        let args = self.invocation_args(argv)?;
+        let (program, args) = match (self, args.first().map(String::as_str)) {
+            (Self::Goose, Some("session" | "s")) => ("goose session", &args[1..]),
+            (Self::Hermes, Some("chat")) => ("hermes chat", &args[1..]),
+            _ => (self.aliases()[0], args),
+        };
+        if !unambiguous_resume_options(args) || self.opts_out_of_sessions(argv) {
+            return None;
+        }
+        Some(format!(
+            "{program}{}",
+            self.session_command_flags("unstarted", Some(argv))?
+        ))
+    }
+
     pub fn resume_command(
         self,
         session_id: &str,
@@ -141,6 +159,13 @@ impl CLIAgent {
     ) -> Option<String> {
         if launch_argv.is_some_and(|argv| self.opts_out_of_sessions(argv)) {
             return None;
+        }
+        if self == CLIAgent::Aider {
+            let history = quoted_history_path(session_id)?;
+            let flags = self.session_command_flags("history", launch_argv)?;
+            return Some(format!(
+                "aider{flags} --chat-history-file {history} --restore-chat-history"
+            ));
         }
         let flags = self.session_command_flags(session_id, launch_argv)?;
         match self {
@@ -170,11 +195,11 @@ impl CLIAgent {
 
     /// An explicit conversation id in a captured resume command. Hooks remain
     /// authoritative; this fills the gap before a resumed agent sends one.
-    /// A fork's argument identifies its parent, and a name or `--last` can
-    /// select a different conversation on the next launch, so neither counts.
+    /// Aider's target is its history file. Other agents need a complete native
+    /// id: names, indexes, `latest`, and a fork's parent are not exact targets.
     pub fn resumed_session_id(self, argv: &[String]) -> Option<&str> {
         if !matches!(self, CLIAgent::Codex | CLIAgent::Claude) {
-            return None;
+            return self.canonical_resumed_session_id(argv);
         }
         let args = self.invocation_args(argv)?;
         let id = match self {
@@ -252,6 +277,85 @@ impl CLIAgent {
         (id.len() == 36 && uuid::Uuid::try_parse(id).is_ok()).then_some(id)
     }
 
+    fn canonical_resumed_session_id(self, argv: &[String]) -> Option<&str> {
+        let args = self.invocation_args(argv)?;
+        let (id, options) = match self {
+            CLIAgent::Amp if args.first()?.as_str() == "threads" => {
+                if args.get(1)?.as_str() != "continue" {
+                    return None;
+                }
+                (args.get(2)?.as_str(), &args[3..])
+            }
+            CLIAgent::Aider => {
+                let [options @ .., flag, id, restore] = args else {
+                    return None;
+                };
+                if flag != "--chat-history-file" || restore != "--restore-chat-history" {
+                    return None;
+                }
+                (id.as_str(), options)
+            }
+            _ => {
+                let [options @ .., flag, id] = args else {
+                    return None;
+                };
+                let selector = match self {
+                    CLIAgent::OpenCode | CLIAgent::Pi | CLIAgent::Kimi => "--session",
+                    CLIAgent::Antigravity => "--conversation",
+                    CLIAgent::Goose => "--session-id",
+                    _ => "--resume",
+                };
+                if flag != selector {
+                    return None;
+                }
+                let options = match self {
+                    CLIAgent::Goose => {
+                        let [session, options @ .., resume] = options else {
+                            return None;
+                        };
+                        if session != "session" || resume != "--resume" {
+                            return None;
+                        }
+                        options
+                    }
+                    CLIAgent::Hermes => {
+                        let [chat, options @ ..] = options else {
+                            return None;
+                        };
+                        if chat != "chat" {
+                            return None;
+                        }
+                        options
+                    }
+                    _ => options,
+                };
+                (id.as_str(), options)
+            }
+        };
+        // Be conservative about an option consuming a following --resume as
+        // its value. Unknown syntax belongs in the user's selection prompt.
+        if !unambiguous_resume_options(options) || !self.resumes_session(id, argv) {
+            return None;
+        }
+        let uuid = |s: &str| s.len() == 36 && uuid::Uuid::try_parse(s).is_ok();
+        let exact = uuid(id)
+            || match self {
+                CLIAgent::Amp => id.strip_prefix("T-").is_some_and(uuid),
+                CLIAgent::OpenCode => id.strip_prefix("ses_").is_some_and(|s| {
+                    s.len() >= 20 && s.len() <= 40 && s.bytes().all(|c| c.is_ascii_alphanumeric())
+                }),
+                CLIAgent::Goose => id.split_once('_').is_some_and(|(date, number)| {
+                    date.len() == 8
+                        && date.bytes().all(|c| c.is_ascii_digit())
+                        && !number.is_empty()
+                        && number.bytes().all(|c| c.is_ascii_digit())
+                }),
+                CLIAgent::Aider => quoted_history_path(id).is_some(),
+                _ => false,
+            };
+        exact.then_some(id)
+    }
+
     /// Whether this is the resume command tty7 would queue for an already
     /// known id. Unlike recovering an unknown id, this works for every agent
     /// with a resume command, including agents whose ids are not UUIDs.
@@ -283,7 +387,7 @@ impl CLIAgent {
         }
     }
 
-    fn opts_out_of_sessions(self, argv: &[String]) -> bool {
+    pub fn opts_out_of_sessions(self, argv: &[String]) -> bool {
         let ephemeral: &[&str] = match self {
             CLIAgent::Pi | CLIAgent::OhMyPi => &["--no-session"],
             // "Do not save conversation history" — nothing is persisted, so
@@ -345,6 +449,7 @@ impl CLIAgent {
         launch_argv: Option<&[String]>,
     ) -> Option<String> {
         if session_id.is_empty()
+            || session_id.starts_with('-')
             || !session_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
@@ -410,6 +515,11 @@ impl CLIAgent {
         }
 
         let stale: &[&str] = match self {
+            CLIAgent::Aider => &[
+                "--chat-history-file",
+                "--restore-chat-history",
+                "--no-restore-chat-history",
+            ],
             CLIAgent::Claude => &[
                 "--resume",
                 "-r",
@@ -720,6 +830,46 @@ pub fn command_argv(command: &str) -> Vec<String> {
     argv
 }
 
+fn quoted_history_path(path: &str) -> Option<String> {
+    if path.is_empty()
+        || path.starts_with('-')
+        || path
+            .chars()
+            .any(|c| c.is_control() || "\"'$`%!".contains(c))
+    {
+        return None;
+    }
+    Some(format!("\"{path}\""))
+}
+
+fn unambiguous_resume_options(options: &[String]) -> bool {
+    let mut args = options.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        let (flag, value) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--yolo"
+            | "--dangerously-skip-permissions"
+            | "--dangerously-allow-all"
+            | "--force"
+            | "--plan"
+            | "--trust"
+            | "--approve-mcps"
+                if value.is_none() => {}
+            "--model" | "-m" | "--weak-model" | "--editor-model" | "--effort" | "--mode"
+            | "--permission-mode" | "--session-dir" | "--cwd" | "--project" | "--agent"
+            | "--add-dir" => {
+                if value.is_none() && args.next().is_none() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn is_env_assignment(token: &str) -> bool {
     match token.split_once('=') {
         Some((key, _)) => {
@@ -794,6 +944,9 @@ pub struct AgentSessionState {
     pub session_id: Option<String>,
     #[serde(default)]
     pub launch_argv: Option<Vec<String>>,
+    /// A plain new launch with no user input or conversation activity yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unstarted: bool,
     #[serde(default)]
     pub rich: bool,
     #[serde(default)]
@@ -819,6 +972,11 @@ impl AgentSessionState {
     }
 
     pub fn apply_event(&mut self, ev: &AgentEvent) {
+        // SessionStart can allocate an id before any conversation history
+        // exists. Keep an untouched launch until actual activity arrives.
+        if ev.kind != AgentEventKind::SessionStart {
+            self.unstarted = false;
+        }
         self.rich = true;
         if let Some(id) = &ev.session_id {
             self.session_id = Some(id.clone());
@@ -936,6 +1094,47 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unstarted_launches_exclude_history_selectors_and_prompts() {
+        for agent in CLIAgent::ALL {
+            let launch = agent.aliases()[0];
+            assert_eq!(
+                agent.unstarted_command(&command_argv(launch)).as_deref(),
+                Some(launch)
+            );
+            for tail in [
+                "resume",
+                "--resume",
+                "--continue",
+                "--last",
+                "--session latest",
+                "--prompt hello",
+                "hello",
+                "--config resume=true",
+                "--model",
+            ] {
+                assert!(
+                    agent
+                        .unstarted_command(&command_argv(&format!("{launch} {tail}")))
+                        .is_none(),
+                    "{launch} {tail} cannot prove a new, empty launch"
+                );
+            }
+        }
+        assert_eq!(
+            CLIAgent::Codex
+                .unstarted_command(&command_argv("codex --yolo"))
+                .as_deref(),
+            Some("codex --yolo")
+        );
+        assert_eq!(
+            CLIAgent::Goose
+                .unstarted_command(&command_argv("goose session"))
+                .as_deref(),
+            Some("goose session")
+        );
     }
 
     #[test]
@@ -1445,6 +1644,93 @@ mod tests {
     }
 
     #[test]
+    fn every_saved_resume_command_can_recover_its_exact_session_id() {
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for agent in CLIAgent::ALL {
+            let Some(command) = agent.resume_command(id, None) else {
+                continue;
+            };
+            let argv = command_argv(&command);
+            assert_eq!(
+                agent.resumed_session_id(&argv),
+                Some(id),
+                "{agent:?}: a persisted explicit resume must not turn into a bare shell"
+            );
+            if let Some(fork) = agent.fork_command(id, None) {
+                assert_eq!(
+                    agent.resumed_session_id(&command_argv(&fork)),
+                    None,
+                    "{agent:?}: a fork's parent is not the pane's new conversation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_targets_are_complete_ids_not_names_indexes_or_option_values() {
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        for agent in CLIAgent::ALL {
+            if agent == CLIAgent::Aider {
+                continue;
+            }
+            for target in ["latest", "last", "123", "my-session"] {
+                let command = agent.resume_command(target, None).unwrap();
+                assert_eq!(
+                    agent.resumed_session_id(&command_argv(&command)),
+                    None,
+                    "{command}"
+                );
+            }
+            assert!(agent.resume_command("--last", None).is_none());
+            if !matches!(agent, CLIAgent::Codex | CLIAgent::Claude) {
+                let launch = command_argv(&format!(
+                    "{} --unknown-option",
+                    agent.resume_command(id, None).unwrap()
+                ));
+                assert!(agent.resumed_session_id(&launch).is_none());
+            }
+        }
+        for (agent, id) in [
+            (CLIAgent::Amp, "T-0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17"),
+            (CLIAgent::OpenCode, "ses_36c1f475affeXzwMW17xl4nTOJ"),
+            (CLIAgent::Goose, "20260911_1"),
+        ] {
+            let command = agent.resume_command(id, None).unwrap();
+            assert_eq!(agent.resumed_session_id(&command_argv(&command)), Some(id));
+        }
+        for agent in [CLIAgent::Gemini, CLIAgent::Cursor, CLIAgent::Antigravity] {
+            let command = agent.resume_command(id, None).unwrap();
+            let program = command_argv(&command)[0].clone();
+            let misleading = format!("{program} --unknown-option --resume {id}");
+            assert_eq!(agent.resumed_session_id(&command_argv(&misleading)), None);
+        }
+    }
+
+    #[test]
+    fn aider_restores_the_selected_history_and_drops_the_previous_file() {
+        let launch = command_argv(
+            "aider --model model-name --chat-history-file old.md --no-restore-chat-history",
+        );
+        let file = r"C:\Work\chat history.md";
+        let command = CLIAgent::Aider.resume_command(file, Some(&launch)).unwrap();
+        assert_eq!(
+            command,
+            format!(
+                "aider --model model-name --chat-history-file \"{file}\" --restore-chat-history"
+            )
+        );
+        assert_eq!(
+            CLIAgent::Aider.resumed_session_id(&command_argv(&command)),
+            Some(file)
+        );
+        assert!(
+            CLIAgent::Aider
+                .resumed_session_id(&command_argv("aider --model model-name"))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn resume_ids_are_explicit_and_never_fork_parents() {
         let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
         for (agent, prefix, suffix) in [
@@ -1603,8 +1889,8 @@ mod tests {
             );
             assert_eq!(
                 agent.resumed_session_id(&captured),
-                None,
-                "preserving a known id does not infer an unknown one"
+                (agent == CLIAgent::Goose).then_some(id),
+                "only a complete native id may be recovered from this command"
             );
         }
         for (agent, command) in [
@@ -1643,7 +1929,21 @@ mod tests {
             CLIAgent::Kimi.resume_command("abc-123", None).as_deref(),
             Some("kimi --session abc-123")
         );
-        assert_eq!(CLIAgent::Aider.resume_command("abc", None), None);
+        assert_eq!(
+            CLIAgent::Aider
+                .resume_command("chat history.md", None)
+                .as_deref(),
+            Some("aider --chat-history-file \"chat history.md\" --restore-chat-history")
+        );
+        for path in [
+            "",
+            "$(boom)",
+            "%TEMP%/history.md",
+            "history\nexit",
+            "--model",
+        ] {
+            assert!(CLIAgent::Aider.resume_command(path, None).is_none());
+        }
         assert_eq!(CLIAgent::Claude.resume_command("abc; rm -rf /", None), None);
         assert_eq!(CLIAgent::Claude.resume_command("$(boom)", None), None);
         assert_eq!(CLIAgent::Claude.resume_command("", None), None);

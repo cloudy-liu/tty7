@@ -1037,13 +1037,34 @@ impl Tty7App {
 
     pub fn for_workspace_at(
         id: Option<WorkspaceId>,
+        initial_cwd: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::for_workspace_at_with_activation(id, initial_cwd, true, window, cx)
+    }
+
+    pub(crate) fn for_workspace_in_background(
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::for_workspace_at_with_activation(Some(id), None, false, window, cx)
+    }
+
+    fn for_workspace_at_with_activation(
+        id: Option<WorkspaceId>,
         mut initial_cwd: Option<std::path::PathBuf>,
+        activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let restore = cx.global::<Config>().restore_session;
         let known = id.is_some_and(|id| WorkspaceStore::all(cx).get(id).is_some());
-        let workspace = WorkspaceStore::claim(cx, id);
+        let workspace = match (activate, id) {
+            (false, Some(id)) => WorkspaceStore::claim_in_background(cx, id),
+            _ => WorkspaceStore::claim(cx, id),
+        };
         let is_remote = WorkspaceStore::all(cx)
             .get(workspace)
             .is_some_and(|w| w.is_remote());
@@ -3260,13 +3281,15 @@ impl Tty7App {
         let was_focused = pending.read(cx).focus_handle.contains_focused(window, cx);
         let restored = parts.restored;
         let view = build_terminal_view(parts, font_size, window, cx);
-        if !restored {
-            let spawn = &pending.read(cx).spawn;
+        if !restored || pending.read(cx).spawn.agent_restore_pending {
+            let spawn = pending.read(cx).spawn.clone();
             resume_agent_in_terminal(
-                view.read(cx),
+                &view,
                 &spawn.agent,
                 spawn.agent_session_id.as_deref(),
                 spawn.agent_launch_argv.as_deref(),
+                spawn.agent_unstarted,
+                window,
                 cx,
             );
         }
@@ -7782,28 +7805,6 @@ fn tab_to_session(tab: &Tab, cx: &App) -> SessionTab {
     }
 }
 
-fn agent_resume_command(
-    agent: &Option<crate::core::cli_agent::CLIAgent>,
-    session_id: Option<&str>,
-    launch_argv: Option<&[String]>,
-    cx: &App,
-) -> Option<String> {
-    if !cx.global::<Config>().restore_agent_sessions {
-        return None;
-    }
-    let agent = agent.as_ref()?;
-    let Some(session_id) =
-        session_id.or_else(|| launch_argv.and_then(|argv| agent.resumed_session_id(argv)))
-    else {
-        log::info!(
-            "{}'s pane had no captured session id; it comes back as a plain shell",
-            agent.display_name()
-        );
-        return None;
-    };
-    agent.resume_command(session_id, launch_argv)
-}
-
 fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
     match pane {
         Pane::Leaf(PaneSlot::Connecting(pending)) => {
@@ -7816,10 +7817,13 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
                 agent: spawn.agent,
                 agent_session_id: spawn.agent_session_id.clone(),
                 agent_launch_argv: spawn.agent_launch_argv.clone(),
+                agent_restore_pending: spawn.agent_restore_pending,
+                agent_unstarted: spawn.agent_unstarted,
             }
         }
         Pane::Leaf(PaneSlot::Ready(view)) => {
             let view = view.read(cx);
+            let pending = view.pending_agent_restore();
             SessionPane::Leaf {
                 cwd: view.spawnable_cwd(),
                 pane_id: Some(view.pane_id),
@@ -7829,9 +7833,17 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
                 // reads, so the gap here costs nothing it can see.
                 shell: view.shell_spec(),
                 ssh_spec: view.ssh_spec(),
-                agent: view.agent(),
-                agent_session_id: view.agent_session().and_then(|s| s.session_id),
-                agent_launch_argv: view.agent_session().and_then(|s| s.launch_argv),
+                agent: pending.as_ref().map(|p| p.agent).or_else(|| view.agent()),
+                agent_session_id: pending.as_ref().map_or_else(
+                    || view.agent_session().and_then(|s| s.session_id),
+                    |p| p.session_id.clone(),
+                ),
+                agent_launch_argv: pending
+                    .as_ref()
+                    .and_then(|p| p.launch_argv.clone())
+                    .or_else(|| view.agent_session().and_then(|s| s.launch_argv)),
+                agent_restore_pending: pending.as_ref().is_some_and(|p| p.restore_pending),
+                agent_unstarted: view.agent_session().is_some_and(|s| s.unstarted),
             }
         }
         Pane::Split {
@@ -7853,24 +7865,39 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
             agent: None,
             agent_session_id: None,
             agent_launch_argv: None,
+            agent_restore_pending: false,
+            agent_unstarted: false,
         },
     }
 }
 
 fn resume_agent_in_terminal(
-    terminal: &TerminalView,
+    terminal: &Entity<TerminalView>,
     agent: &Option<crate::core::cli_agent::CLIAgent>,
     session_id: Option<&str>,
     launch_argv: Option<&[String]>,
-    cx: &App,
+    unstarted: bool,
+    window: &mut Window,
+    cx: &mut App,
 ) {
-    if let Some(command) = agent_resume_command(agent, session_id, launch_argv, cx) {
-        let agent = agent.expect("a resume command has an agent");
-        let session_id = session_id
-            .or_else(|| launch_argv.and_then(|argv| agent.resumed_session_id(argv)))
-            .expect("a resume command has a session id");
-        terminal.run_resumed_agent(agent, session_id, &command);
-    }
+    let Some(agent) = agent.filter(|agent| {
+        cx.global::<Config>().restore_agent_sessions
+            && !launch_argv.is_some_and(|argv| agent.opts_out_of_sessions(argv))
+    }) else {
+        return;
+    };
+    terminal.update(cx, |terminal, cx| {
+        if unstarted
+            && let Some(command) = launch_argv.and_then(|argv| agent.unstarted_command(argv))
+        {
+            terminal
+                .terminal
+                .seed_unstarted_agent(agent, crate::core::cli_agent::command_argv(&command));
+            terminal.run_command_line(&command);
+        } else {
+            terminal.restore_agent(agent, session_id, launch_argv, window, cx);
+        }
+    });
 }
 
 /// The daemon's account of which panes are alive, or `None` when it could not
@@ -8030,6 +8057,8 @@ fn session_to_pane(
             agent,
             agent_session_id,
             agent_launch_argv,
+            agent_restore_pending,
+            agent_unstarted,
         } => {
             let same_daemon =
                 leaf_shares_the_window_daemon(workspace.is_some(), ssh_spec.is_some());
@@ -8066,12 +8095,16 @@ fn session_to_pane(
                 }
             };
             match &view {
-                PaneSlot::Ready(terminal) if !terminal.read(cx).restored() => {
+                PaneSlot::Ready(terminal)
+                    if !terminal.read(cx).restored() || *agent_restore_pending =>
+                {
                     resume_agent_in_terminal(
-                        terminal.read(cx),
+                        terminal,
                         agent,
                         agent_session_id.as_deref(),
                         agent_launch_argv.as_deref(),
+                        *agent_unstarted,
+                        window,
                         cx,
                     );
                 }
@@ -8081,6 +8114,8 @@ fn session_to_pane(
                         pending.spawn.agent = *agent;
                         pending.spawn.agent_session_id = agent_session_id.clone();
                         pending.spawn.agent_launch_argv = agent_launch_argv.clone();
+                        pending.spawn.agent_restore_pending = *agent_restore_pending;
+                        pending.spawn.agent_unstarted = *agent_unstarted;
                     });
                 }
             }
@@ -8137,6 +8172,8 @@ pub(crate) fn new_terminal(
         agent: None,
         agent_session_id: None,
         agent_launch_argv: None,
+        agent_restore_pending: false,
+        agent_unstarted: false,
         owner,
         font_size,
     };
@@ -9192,6 +9229,86 @@ mod tests {
     }
 
     #[gpui::test]
+    fn unstarted_agents_reopen_and_keep_their_state_across_two_saves(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{Tab, pane_to_session, resume_agent_in_terminal};
+        use crate::core::cli_agent::{CLIAgent, command_argv};
+        use crate::core::session::SessionPane;
+        use crate::terminal::view::quiet_test_pane;
+        use crate::ui::pane::{Pane, PaneSlot};
+        use crate::ui::tree_sync::{DesiredNode, desired_tabs};
+        use tty7_core::core::machine::{AgentFacts, MACHINE_FILE, MachineStore, PaneSeed};
+
+        let (app, mut vcx) = super::test_window::harness(cx);
+        for (agent, allocated_id) in CLIAgent::ALL.into_iter().flat_map(|agent| {
+            [None, Some("51f12f86-4f02-4f17-ba7e-78c96a4fdcdb")]
+                .into_iter()
+                .map(move |id| (agent, id))
+        }) {
+            let program = match agent {
+                CLIAgent::Cursor => "cursor-agent",
+                CLIAgent::Antigravity => "agy",
+                _ => agent.slug(),
+            };
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(MACHINE_FILE);
+            let mut store = MachineStore::open(path.clone());
+            let workspace = store.workspace_create(None, None, None).unwrap();
+            let mut seed = PaneSeed::bare(1);
+            seed.agent = Some(AgentFacts {
+                agent,
+                session_id: allocated_id.map(str::to_string),
+                launch_argv: Some(command_argv(program)),
+                restore_pending: false,
+                unstarted: true,
+                status: None,
+            });
+            store
+                .tab_create(workspace.id, None, seed, None, None)
+                .unwrap();
+            for pane in 2..=3 {
+                let saved = store.pane(pane - 1).unwrap().agent.unwrap();
+                let (seed, _daemon) = app.update_in(&mut vcx, |app, window, cx| {
+                    let (view, daemon) = quiet_test_pane(pane, window, cx);
+                    resume_agent_in_terminal(
+                        &view,
+                        &Some(agent),
+                        saved.session_id.as_deref(),
+                        saved.launch_argv.as_deref(),
+                        saved.unstarted,
+                        window,
+                        cx,
+                    );
+                    assert!(view.read(cx).pending_agent_restore().is_none(), "{agent:?}");
+                    app.tabs = vec![Tab::new(Pane::leaf(PaneSlot::Ready(view)))];
+                    let SessionPane::Leaf {
+                        agent_unstarted,
+                        agent_session_id,
+                        ..
+                    } = pane_to_session(&app.tabs[0].pane, cx)
+                    else {
+                        panic!("leaf expected")
+                    };
+                    assert!(agent_unstarted);
+                    assert!(agent_session_id.is_none());
+                    let (tabs, _, _) = desired_tabs(app, cx);
+                    let DesiredNode::Leaf { seed, .. } = &tabs[0].root else {
+                        panic!("leaf expected")
+                    };
+                    (seed.clone(), daemon)
+                });
+                store
+                    .pane_replace(workspace.id, pane - 1, seed, None)
+                    .unwrap();
+                store.flush();
+                store = MachineStore::open(path.clone());
+                assert!(store.pane(pane).unwrap().agent.unwrap().unstarted);
+            }
+        }
+    }
+
+    #[gpui::test]
     fn a_resumed_pane_saves_its_session_before_any_daemon_report(cx: &mut gpui::TestAppContext) {
         use super::{Tab, pane_to_session, resume_agent_in_terminal};
         use crate::core::cli_agent::{CLIAgent, command_argv};
@@ -9219,6 +9336,8 @@ mod tests {
                 agent,
                 session_id: Some(session_id.into()),
                 launch_argv: Some(command_argv(&launch)),
+                restore_pending: false,
+                unstarted: false,
                 status: None,
             });
             store
@@ -9230,10 +9349,12 @@ mod tests {
                 let (seed, _daemon) = app.update_in(&mut vcx, |app, window, cx| {
                     let (view, daemon) = quiet_test_pane(pane, window, cx);
                     resume_agent_in_terminal(
-                        view.read(cx),
+                        &view,
                         &Some(saved.agent),
                         saved.session_id.as_deref(),
                         saved.launch_argv.as_deref(),
+                        false,
+                        window,
                         cx,
                     );
                     app.tabs = vec![Tab::new(Pane::leaf(PaneSlot::Ready(view)))];
@@ -9276,20 +9397,50 @@ mod tests {
 
     #[gpui::test]
     fn missing_session_metadata_can_recover_an_explicit_resume(cx: &mut gpui::TestAppContext) {
-        use super::agent_resume_command;
+        use super::resume_agent_in_terminal;
         use crate::core::cli_agent::{CLIAgent, command_argv};
         use crate::core::config::Config;
+        use crate::terminal::view::quiet_test_pane;
 
-        cx.update(|cx| {
-            cx.set_global(Config::default());
-            let launch = command_argv("codex resume 0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17 --yolo");
-            assert_eq!(
-                agent_resume_command(&Some(CLIAgent::Codex), None, Some(&launch), cx),
-                Some(launch.join(" "))
+        let (app, mut vcx) = super::test_window::harness(cx);
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        app.update_in(&mut vcx, |_app, window, cx| {
+            for agent in CLIAgent::ALL {
+                if agent == CLIAgent::Aider {
+                    continue;
+                }
+                let launch = command_argv(&agent.resume_command(id, None).unwrap());
+                let (view, _daemon) = quiet_test_pane(1, window, cx);
+                resume_agent_in_terminal(
+                    &view,
+                    &Some(agent),
+                    None,
+                    Some(&launch),
+                    false,
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    view.read(cx).agent_session().unwrap().session_id.as_deref(),
+                    Some(id),
+                    "{agent:?}"
+                );
+                assert!(view.read(cx).pending_agent_restore().is_none());
+            }
+            let launch = command_argv(&format!("codex resume {id} --yolo"));
+            let (view, _daemon) = quiet_test_pane(1, window, cx);
+            resume_agent_in_terminal(
+                &view,
+                &Some(CLIAgent::Codex),
+                Some("new-id"),
+                Some(&launch),
+                false,
+                window,
+                cx,
             );
             assert_eq!(
-                agent_resume_command(&Some(CLIAgent::Codex), Some("new-id"), Some(&launch), cx),
-                Some("codex resume new-id --yolo".into()),
+                view.read(cx).agent_session().unwrap().session_id.as_deref(),
+                Some("new-id"),
                 "a newer hook id wins"
             );
 
@@ -9298,25 +9449,127 @@ mod tests {
                 "codex resume --last",
                 "codex --yolo",
             ] {
-                assert!(
-                    agent_resume_command(
-                        &Some(CLIAgent::Codex),
-                        None,
-                        Some(&command_argv(command)),
-                        cx
-                    )
-                    .is_none()
+                let (view, _daemon) = quiet_test_pane(1, window, cx);
+                resume_agent_in_terminal(
+                    &view,
+                    &Some(CLIAgent::Codex),
+                    None,
+                    Some(&command_argv(command)),
+                    false,
+                    window,
+                    cx,
                 );
+                assert!(
+                    view.read(cx).pending_agent_restore().is_none(),
+                    "{command} leaves a plain shell when its session is unknown"
+                );
+                assert!(view.read(cx).agent_session().is_none());
+            }
+            for (agent, launch) in [
+                (CLIAgent::Pi, "pi --no-session"),
+                (CLIAgent::OhMyPi, "omp --no-session"),
+                (CLIAgent::Auggie, "auggie --dont-save-session"),
+                (CLIAgent::Qwen, "qwen --no-chat-recording"),
+            ] {
+                let (view, _daemon) = quiet_test_pane(1, window, cx);
+                resume_agent_in_terminal(
+                    &view,
+                    &Some(agent),
+                    Some(id),
+                    Some(&command_argv(launch)),
+                    false,
+                    window,
+                    cx,
+                );
+                assert!(view.read(cx).pending_agent_restore().is_none());
+                assert!(view.read(cx).agent_session().is_none());
             }
             cx.global_mut::<Config>().restore_agent_sessions = false;
-            assert!(
-                agent_resume_command(&Some(CLIAgent::Codex), None, Some(&launch), cx).is_none()
-            );
-            assert!(
-                agent_resume_command(&Some(CLIAgent::Codex), Some("known-id"), Some(&launch), cx)
-                    .is_none()
-            );
+            for id in [None, Some("known-id")] {
+                let (view, _daemon) = quiet_test_pane(1, window, cx);
+                resume_agent_in_terminal(
+                    &view,
+                    &Some(CLIAgent::Codex),
+                    id,
+                    Some(&launch),
+                    false,
+                    window,
+                    cx,
+                );
+                assert!(view.read(cx).pending_agent_restore().is_none());
+                assert!(view.read(cx).agent_session().is_none());
+            }
         });
+    }
+
+    #[gpui::test]
+    fn unknown_agent_sessions_restore_to_a_plain_shell(cx: &mut gpui::TestAppContext) {
+        use super::resume_agent_in_terminal;
+        use crate::core::cli_agent::CLIAgent;
+        use crate::terminal::view::quiet_test_pane;
+
+        let (app, mut vcx) = super::test_window::harness(cx);
+        app.update_in(&mut vcx, |_app, window, cx| {
+            for agent in CLIAgent::ALL {
+                let (view, _daemon) = quiet_test_pane(1, window, cx);
+                resume_agent_in_terminal(&view, &Some(agent), None, None, false, window, cx);
+                assert!(view.read(cx).pending_agent_restore().is_none(), "{agent:?}");
+                assert!(view.read(cx).agent().is_none(), "{agent:?}");
+                assert!(view.read(cx).agent_session().is_none(), "{agent:?}");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn unknown_agents_leave_plain_shells_across_two_saves(cx: &mut gpui::TestAppContext) {
+        use super::{Tab, pane_to_session, resume_agent_in_terminal};
+        use crate::core::cli_agent::CLIAgent;
+        use crate::core::session::SessionPane;
+        use crate::terminal::view::quiet_test_pane;
+        use crate::ui::pane::{Pane, PaneSlot};
+        use crate::ui::tree_sync::{DesiredNode, desired_tabs};
+        use tty7_core::core::machine::{MACHINE_FILE, MachineStore, PaneSeed};
+
+        let (app, mut vcx) = super::test_window::harness(cx);
+        for agent in CLIAgent::ALL {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(MACHINE_FILE);
+            let mut store = MachineStore::open(path.clone());
+            let ws = store.workspace_create(None, None, None).unwrap();
+            store
+                .tab_create(ws.id, None, PaneSeed::bare(1), None, None)
+                .unwrap();
+            for pane in 2..=3 {
+                let (seed, _daemon) = app.update_in(&mut vcx, |app, window, cx| {
+                    let (view, daemon) = quiet_test_pane(pane, window, cx);
+                    resume_agent_in_terminal(&view, &Some(agent), None, None, false, window, cx);
+                    assert!(
+                        view.read(cx).agent_session().is_none(),
+                        "an unknown session must not invent a running agent"
+                    );
+                    app.tabs = vec![Tab::new(Pane::leaf(PaneSlot::Ready(view)))];
+                    let SessionPane::Leaf {
+                        agent: saved,
+                        agent_restore_pending,
+                        ..
+                    } = pane_to_session(&app.tabs[0].pane, cx)
+                    else {
+                        panic!("leaf");
+                    };
+                    assert_eq!(saved, None);
+                    assert!(!agent_restore_pending);
+                    let (tabs, _, _) = desired_tabs(app, cx);
+                    let DesiredNode::Leaf { seed, .. } = &tabs[0].root else {
+                        panic!("leaf");
+                    };
+                    (seed.clone(), daemon)
+                });
+                store.pane_replace(ws.id, pane - 1, seed, None).unwrap();
+                store.flush();
+                store = MachineStore::open(path.clone());
+                assert!(store.pane(pane).unwrap().agent.is_none());
+            }
+        }
     }
 
     #[gpui::test]
@@ -9339,6 +9592,8 @@ mod tests {
                         agent: Some(CLIAgent::Claude),
                         agent_session_id: Some("sid-abc".to_string()),
                         agent_launch_argv: Some(vec!["claude".to_string()]),
+                        agent_restore_pending: false,
+                        agent_unstarted: false,
                         owner: None,
                         font_size: 14.0,
                     },

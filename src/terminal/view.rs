@@ -227,6 +227,7 @@ pub struct TerminalView {
     shell_spec: Option<ShellSpec>,
     owner_workspace: Option<crate::core::session::WorkspaceId>,
     restored: bool,
+    pub(super) agent_restore: Option<super::agent_restore::PendingAgentRestore>,
     ssh_spec: Option<Box<crate::daemon::protocol::NativeSshSpec>>,
     /// The verified remote staging directory for pasted images, once one has
     /// been prepared for this pane. `None` means "not prepared yet", never
@@ -1280,6 +1281,7 @@ impl TerminalView {
             shell_spec: None,
             owner_workspace: None,
             restored: false,
+            agent_restore: None,
             ssh_spec: None,
             remote_clipboard_dir: None,
             focus_handle,
@@ -1714,13 +1716,32 @@ impl TerminalView {
         agent: crate::core::cli_agent::CLIAgent,
         session_id: &str,
         command: &str,
+        cx: &mut Context<Self>,
     ) {
-        self.terminal.seed_resumed_agent(
-            agent,
-            session_id,
-            crate::core::cli_agent::command_argv(command),
+        let argv = crate::core::cli_agent::command_argv(command);
+        let command = if agent == crate::core::cli_agent::CLIAgent::Aider {
+            let shell = self.shell_program();
+            argv.iter()
+                .map(|arg| quote_for_shell(arg, shell.as_deref()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            command.to_string()
+        };
+        let supported = crate::ui::tree_sync::control_for(cx, self.host_id).is_some_and(|client| {
+            client
+                .hello()
+                .has_feature(crate::daemon::protocol::FEATURE_AGENT_RESUME)
+        });
+        self.terminal.resume_agent(
+            crate::daemon::protocol::AgentResume {
+                agent,
+                session_id: session_id.to_string(),
+                launch_argv: argv,
+                command,
+            },
+            supported,
         );
-        self.run_command_line(command);
     }
 
     pub fn shell_spec(&self) -> Option<ShellSpec> {
@@ -1822,6 +1843,7 @@ impl TerminalView {
 
     fn handle_event(&mut self, ev: AlacEvent, cx: &mut Context<Self>) {
         self.terminal.poll_exited();
+        self.sync_pending_agent_restore(cx);
         self.sync_typeahead_owner();
         if self.terminal.has_pending_auth() {
             cx.emit(AuthPromptReady);
@@ -8932,6 +8954,7 @@ mod gpui_tests {
                 message: None,
                 session_id: Some("sid-abc".into()),
                 launch_argv: Some(vec!["claude".into()]),
+                unstarted: false,
                 rich: true,
                 cwd: None,
                 activity: 0,
@@ -8987,6 +9010,7 @@ mod gpui_tests {
             message: None,
             session_id: Some("sid-abc".into()),
             launch_argv: Some(vec!["claude".into()]),
+            unstarted: false,
             rich: true,
             cwd: None,
             activity: 0,
@@ -9042,6 +9066,7 @@ mod gpui_tests {
             message: None,
             session_id: Some("sid-abc".into()),
             launch_argv: Some(vec!["claude".into()]),
+            unstarted: false,
             rich: true,
             cwd: None,
             activity: 0,
@@ -9153,6 +9178,7 @@ mod gpui_tests {
             message: None,
             session_id: Some("sid-wt".into()),
             launch_argv: Some(vec!["claude".into()]),
+            unstarted: false,
             rich: true,
             cwd: Some(working_in.clone()),
             activity: 0,

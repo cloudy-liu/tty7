@@ -23,6 +23,10 @@ pub const FEATURE_RESIZE_ECHO: &str = "resize-echo";
 /// claim a restore that never happened.
 pub const FEATURE_RESTORE_SCROLLBACK: &str = "restore-scrollback";
 
+/// Record an explicitly selected conversation before submitting its resume
+/// command on the pane's controlling connection.
+pub const FEATURE_AGENT_RESUME: &str = "agent-resume";
+
 /// The daemon can replace its own binary without stopping, keeping every pty
 /// and everything running on one — `ClientMsg::Handoff`. Advertised only where
 /// it can actually be done, which is where `execve` exists, so a client can use
@@ -47,6 +51,7 @@ impl DaemonVersion {
             FEATURE_PANE_OWNER.to_string(),
             FEATURE_RESIZE_ECHO.to_string(),
             FEATURE_RESTORE_SCROLLBACK.to_string(),
+            FEATURE_AGENT_RESUME.to_string(),
         ];
         if cfg!(unix) {
             features.push(FEATURE_HANDOFF.to_string());
@@ -721,6 +726,14 @@ pub enum SshPhase {
     Failed { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentResume {
+    pub agent: crate::core::cli_agent::CLIAgent,
+    pub session_id: String,
+    pub launch_argv: Vec<String>,
+    pub command: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMsg {
     Spawn {
@@ -740,6 +753,7 @@ pub enum ClientMsg {
         size: WinSize,
     },
     Input(Vec<u8>),
+    ResumeAgent(AgentResume),
     SendInput {
         pane_id: u64,
         bytes: Vec<u8>,
@@ -900,6 +914,7 @@ mod kind {
     pub const OBSERVE: u8 = 54;
     pub const SEND_INPUT: u8 = 55;
     pub const HANDOFF: u8 = 56;
+    pub const RESUME_AGENT: u8 = 57;
 
     pub const SPAWNED: u8 = 1;
     pub const SNAPSHOT: u8 = 2;
@@ -1084,6 +1099,7 @@ impl ClientMsg {
                 write_frame(w, kind::OBSERVE, &to_json(&(pane_id, size))?)
             }
             ClientMsg::Input(bytes) => write_frame(w, kind::INPUT, bytes),
+            ClientMsg::ResumeAgent(resume) => write_frame(w, kind::RESUME_AGENT, &to_json(resume)?),
             ClientMsg::SendInput { pane_id, bytes } => {
                 write_frame(w, kind::SEND_INPUT, &to_json(&(pane_id, bytes))?)
             }
@@ -1192,6 +1208,7 @@ impl ClientMsg {
                 ClientMsg::Observe { pane_id, size }
             }
             kind::INPUT => ClientMsg::Input(payload),
+            kind::RESUME_AGENT => ClientMsg::ResumeAgent(from_json(&payload)?),
             kind::SEND_INPUT => {
                 let (pane_id, bytes) = from_json(&payload)?;
                 ClientMsg::SendInput { pane_id, bytes }
@@ -1520,6 +1537,12 @@ mod tests {
                 size: SIZE,
             },
             ClientMsg::Input(vec![0x1b, b'[', b'A', 0, 255]),
+            ClientMsg::ResumeAgent(AgentResume {
+                agent: crate::core::cli_agent::CLIAgent::Codex,
+                session_id: "selected-id".into(),
+                launch_argv: vec!["codex".into(), "resume".into(), "selected-id".into()],
+                command: "codex resume selected-id".into(),
+            }),
             ClientMsg::SendInput {
                 pane_id: 42,
                 bytes: vec![b'l', b's', b'\r', 0, 255],
@@ -1699,6 +1722,7 @@ mod tests {
                 rich: true,
                 cwd: Some("/repo/.claude/worktrees/fix-x".into()),
                 activity: 12,
+                unstarted: false,
             })),
             DaemonMsg::AgentStatus(None),
             DaemonMsg::LoopbackForward(LoopbackForward { local_port: 49152 }),

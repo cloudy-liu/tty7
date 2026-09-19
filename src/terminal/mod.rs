@@ -1,4 +1,5 @@
 pub(crate) mod agent_marks;
+mod agent_restore;
 mod boxdraw;
 mod cmd_editor;
 mod completion;

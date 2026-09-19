@@ -1546,6 +1546,7 @@ mod tests {
                     rich: true,
                     cwd: Some("/work/api".into()),
                     activity: 3,
+                    unstarted: false,
                 },
             }])),
             ControlReply::Ok(ReplyOk::AgentStates(Vec::new())),

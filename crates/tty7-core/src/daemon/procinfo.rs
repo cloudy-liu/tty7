@@ -7,10 +7,49 @@ const MAX_DEPTH: u8 = 6;
 const MAX_PROCS: usize = 64;
 
 pub fn snapshot(shell_pid: u32, fg_pgid: Option<i32>) -> PaneProcs {
-    let table = process_table();
-    let procs = walk(&table, shell_pid, fg_pgid);
+    let procs = processes(shell_pid, fg_pgid);
     let ports = listening_ports(&procs);
     PaneProcs { procs, ports }
+}
+
+pub(super) fn processes(shell_pid: u32, fg_pgid: Option<i32>) -> Vec<ProcEntry> {
+    walk(&process_table(), shell_pid, fg_pgid)
+}
+
+#[cfg(windows)]
+pub(super) fn open_files(pid: u32) -> Vec<std::path::PathBuf> {
+    crate::daemon::winproc::open_files(pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn open_files(pid: u32) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn open_files(pid: u32) -> Vec<std::path::PathBuf> {
+    let Ok(output) = std::process::Command::new("lsof")
+        .args(["-Fn", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n').map(Into::into))
+        .collect()
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub(super) fn open_files(_pid: u32) -> Vec<std::path::PathBuf> {
+    Vec::new()
 }
 
 struct Row {

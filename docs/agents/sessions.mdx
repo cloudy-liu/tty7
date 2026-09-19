@@ -4,7 +4,7 @@ description: "Resuming a conversation after a reboot, forking a live one, and ge
 ---
 
 Coding agents keep their own conversation history, addressed by a session id.
-Because tty7's hooks learn that id, it can do three things with it.
+tty7 saves the current id with the pane so it survives app and server restarts.
 
 ## Resume after a restart
 
@@ -24,19 +24,48 @@ restart before its next hook arrives can resume the same conversation again.
 Exiting the agent, or returning to the shell after a failed resume, clears the
 pane's session identity.
 
-When tty7 already knows the session id, restore is supported for every recognised
-agent except Aider. Turn it off with `restore_agent_sessions: false`.
+When tty7 knows the exact session id, it resumes that conversation in its
+original pane. Turn automatic restore off with `restore_agent_sessions: false`.
+Launch options that disable session history are also respected.
+
+A plain interactive agent launch left untouched reopens directly, with its
+launch options. A `SessionStart` hook may allocate an id before any conversation
+history exists, as Claude Code does. That event keeps the untouched-launch
+marker, even with an id, so restart opens the agent instead of trying to resume
+nonexistent history. Once you type into the agent or it reports conversation
+activity, tty7 needs the exact session id to resume it. An unknown session
+leaves a fresh shell.
 
 <Note>
-  Hooks capture the id for new conversations. For Codex and Claude, tty7 can
-  also recover an explicit session id from a saved resume command.
+  Hooks capture the id for new conversations. tty7 can also recover a complete
+  id from an agent's saved, explicit resume command. Names, numeric indexes,
+  `latest`, and a fork's parent id are not used to guess the original session.
   [Installing hooks →](/agents/status)
 </Note>
 
+Codex's native history picker can open a conversation without reporting its id
+through a hook. While Codex runs, tty7 also checks the session files that its
+process has open and saves an unambiguous id. This runs even without an open
+app window and once more before a requested server shutdown. Selecting an old
+conversation does not require sending a new message to make it restorable.
+
 Cursor, Antigravity (`agy`), Amp, Auggie, Hermes and Vibe have resume commands but
 no built-in tty7 hooks to capture new conversation ids. Recognising their process
-alone is not enough to restore a conversation. An id already reported to tty7 is
-preserved across restarts, but a new conversation without one returns as a shell.
+alone is not enough to identify a conversation. An id already reported to tty7
+is preserved across restarts.
+
+## When a session cannot be restored
+
+If the original conversation cannot be identified, tty7 leaves a usable shell.
+It does not display a session-selection prompt or choose the most recent
+conversation. You can run the agent's own resume command from that shell.
+
+Aider restores messages from a chat history file instead of a native session
+id. When its original path is known, tty7 checks that the file
+exists on the pane's machine before running
+`aider --chat-history-file <path> --restore-chat-history`. Later restarts use
+that same path. It does not guess a file when Aider's original history path is
+unknown, and an unavailable file leaves a shell.
 
 ## Fork a live session
 

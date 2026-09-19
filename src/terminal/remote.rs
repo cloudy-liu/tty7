@@ -1643,6 +1643,30 @@ impl RemoteTerminal {
         }
     }
 
+    pub fn resume_agent(&self, resume: crate::daemon::protocol::AgentResume, supported: bool) {
+        self.seed_resumed_agent(resume.agent, &resume.session_id, resume.launch_argv.clone());
+        if supported {
+            self.link.send(ClientMsg::ResumeAgent(resume));
+        } else {
+            // Old servers still receive the explicit resume command. Do not
+            // send a frame they cannot decode on a live pane connection.
+            self.write(format!("{}\r", resume.command).into_bytes());
+        }
+    }
+
+    pub fn seed_unstarted_agent(&self, agent: CLIAgent, launch_argv: Vec<String>) {
+        if let (Ok(mut current_agent), Ok(mut current_session)) =
+            (self.agent.lock(), self.agent_session.lock())
+        {
+            *current_agent = Some(agent);
+            *current_session = Some(AgentSessionState {
+                launch_argv: Some(launch_argv),
+                unstarted: true,
+                ..Default::default()
+            });
+        }
+    }
+
     /// This pane's agent turns, anchored to the scrollback. Same cheap handle
     /// clone as [`images`](Self::images), shared with the reader thread.
     pub fn agent_turns(&self) -> AgentTurns {
@@ -2821,6 +2845,40 @@ fn win_size(size: TermSize, cell_w: u16, cell_h: u16) -> WinSize {
 #[cfg(test)]
 mod agent_resume_tests {
     use super::*;
+
+    #[test]
+    fn resume_sends_one_ordered_request_and_falls_back_for_older_servers() {
+        crate::core::config::pin_test_config_dir();
+        let id = "0199c3f2-1b0e-7c3a-9f21-6d4b8e2a5c17";
+        let command = CLIAgent::Codex.resume_command(id, None).unwrap();
+        let resume = crate::daemon::protocol::AgentResume {
+            agent: CLIAgent::Codex,
+            session_id: id.into(),
+            launch_argv: crate::core::cli_agent::command_argv(&command),
+            command,
+        };
+        for supported in [true, false] {
+            let (client, mut daemon) = socket_pair();
+            daemon
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let terminal = RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
+            terminal.resume_agent(resume.clone(), supported);
+            let sent = ClientMsg::read(&mut daemon).unwrap();
+            assert_eq!(
+                sent,
+                if supported {
+                    ClientMsg::ResumeAgent(resume.clone())
+                } else {
+                    ClientMsg::Input(format!("{}\r", resume.command).into_bytes())
+                }
+            );
+            assert_eq!(
+                terminal.agent_session().unwrap().session_id.as_deref(),
+                Some(id)
+            );
+        }
+    }
 
     fn socket_pair() -> (Stream, Stream) {
         #[cfg(unix)]
@@ -4810,6 +4868,7 @@ mod tests {
             message: Some("Claude needs your permission".into()),
             session_id: Some("sid-1".into()),
             launch_argv: None,
+            unstarted: false,
             rich: true,
             cwd: None,
             activity: 0,

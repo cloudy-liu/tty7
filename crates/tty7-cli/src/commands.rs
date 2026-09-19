@@ -2941,6 +2941,8 @@ mod tests {
             agent,
             session_id: None,
             launch_argv: None,
+            restore_pending: false,
+            unstarted: false,
             status: None,
         });
     }

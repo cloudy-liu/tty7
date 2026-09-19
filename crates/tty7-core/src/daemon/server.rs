@@ -195,9 +195,20 @@ fn spawn_snapshot_keeper(registry: Arc<Registry>) {
         .name("tty7-scrollback".into())
         .spawn(move || {
             let mut marks: HashMap<u64, u64> = HashMap::new();
+            let mut next_snapshot =
+                std::time::Instant::now() + crate::daemon::scrollback::SNAPSHOT_INTERVAL;
             loop {
-                std::thread::sleep(crate::daemon::scrollback::SNAPSHOT_INTERVAL);
-                for pane in registry.all() {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let panes = registry.all();
+                for pane in &panes {
+                    pane.refresh_agent_session();
+                }
+                if std::time::Instant::now() < next_snapshot {
+                    continue;
+                }
+                next_snapshot =
+                    std::time::Instant::now() + crate::daemon::scrollback::SNAPSHOT_INTERVAL;
+                for pane in panes {
                     if marks.get(&pane.id) == Some(&pane.scrollback_mark()) {
                         continue;
                     }
@@ -224,6 +235,7 @@ fn spawn_snapshot_keeper(registry: Arc<Registry>) {
 /// [`SNAPSHOT_INTERVAL`](crate::daemon::scrollback::SNAPSHOT_INTERVAL) stale.
 fn store_scrollback_now(registry: &Registry) {
     for pane in registry.all() {
+        pane.refresh_agent_session();
         let (segments, title, _) = pane.scrollback_snapshot();
         crate::daemon::scrollback::save(pane.id, &segments, title.as_deref());
     }
@@ -1081,7 +1093,7 @@ fn stream_observer(
 fn observe_loop<R: std::io::Read>(read_stream: &mut R, refusals: &mpsc::Sender<DaemonMsg>) {
     loop {
         match ClientMsg::read(read_stream) {
-            Ok(ClientMsg::Input(_)) | Ok(ClientMsg::Resize(_)) => {
+            Ok(ClientMsg::Input(_)) | Ok(ClientMsg::ResumeAgent(_)) | Ok(ClientMsg::Resize(_)) => {
                 let refused = refusals.send(DaemonMsg::Error(
                     "this connection is a read-only observer; attach to write".to_string(),
                 ));
@@ -1131,6 +1143,14 @@ fn run_stream(
                         break 'conn;
                     }
                     pane.write_input(&bytes);
+                }
+                ClientMsg::ResumeAgent(resume) => {
+                    if !pane.controls(epoch) {
+                        break 'conn;
+                    }
+                    if let Err(error) = pane.resume_agent(&resume) {
+                        log::warn!("cannot resume agent in pane {id}: {error}");
+                    }
                 }
                 ClientMsg::Resize(size) => {
                     if !pane.controls(epoch) {
@@ -1312,6 +1332,14 @@ mod tests {
             .encode(&mut wire)
             .unwrap();
         ClientMsg::Resize(size).encode(&mut wire).unwrap();
+        ClientMsg::ResumeAgent(crate::daemon::protocol::AgentResume {
+            agent: crate::core::cli_agent::CLIAgent::Codex,
+            session_id: "selected-id".into(),
+            launch_argv: vec!["codex".into(), "resume".into(), "selected-id".into()],
+            command: "codex resume selected-id".into(),
+        })
+        .encode(&mut wire)
+        .unwrap();
         ClientMsg::QueryProcs { pane_id: 1 }
             .encode(&mut wire)
             .unwrap();
@@ -1331,6 +1359,10 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(DaemonMsg::Error(m)) if m.contains("read-only")),
             "an observer's Resize must be answered with an Error, not applied"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Error(m)) if m.contains("read-only")),
+            "an observer cannot start an agent or change its saved identity"
         );
         assert!(
             rx.try_recv().is_err(),

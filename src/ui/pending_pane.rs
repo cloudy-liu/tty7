@@ -20,6 +20,8 @@ pub struct PendingSpawn {
     pub agent: Option<crate::core::cli_agent::CLIAgent>,
     pub agent_session_id: Option<String>,
     pub agent_launch_argv: Option<Vec<String>>,
+    pub agent_restore_pending: bool,
+    pub agent_unstarted: bool,
     pub owner: Option<crate::core::session::WorkspaceId>,
     pub font_size: f32,
 }
