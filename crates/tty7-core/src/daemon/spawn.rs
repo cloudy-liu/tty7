@@ -194,6 +194,12 @@ fn live_recorded_daemon() -> Option<u32> {
     pidfile::read().filter(|&pid| pid > 4 && pid != std::process::id() && daemon_process_alive(pid))
 }
 
+fn preexisting_daemon_pid() -> Option<u32> {
+    // A held singleton seat still identifies the pane owner if writing
+    // daemon.pid failed or the file was removed while the daemon stayed alive.
+    live_recorded_daemon().or_else(crate::daemon::singleton::holder_pid)
+}
+
 #[cfg(windows)]
 fn daemon_process_alive(pid: u32) -> bool {
     !crate::daemon::winproc::wait_for_exit(pid, Duration::ZERO)
@@ -224,13 +230,13 @@ pub fn ensure_running_with_outcome() -> anyhow::Result<DaemonStartup> {
     // launcher can claim the seat: an answering holder with this same pid kept
     // the panes, while a different holder is a fresh daemon that needs full
     // workspace hydration.
-    let continuity_pid = live_recorded_daemon();
+    let continuity_pid = preexisting_daemon_pid();
     let mut stale = recorded_daemon_is_dead();
     if !stale {
         if let Ok(mut stream) = transport::connect() {
             let probe = query_daemon_version(&mut stream);
             let startup = probe.startup_outcome().map(|_| {
-                answering_daemon_outcome(continuity_pid, crate::daemon::singleton::holder_pid())
+                initial_answer_outcome(continuity_pid, crate::daemon::singleton::holder_pid())
             });
             match probe {
                 VersionProbe::Speaks(v) if v.protocol == PROTOCOL_VERSION => {
@@ -369,7 +375,7 @@ pub fn reap_stranded() {
 /// Reaps an unreachable seat holder, or reports that it began answering
 /// during the handoff/startup grace period and therefore still owns its panes.
 pub fn reap_stranded_with_outcome() -> Option<DaemonStartup> {
-    let continuity_pid = live_recorded_daemon();
+    let continuity_pid = preexisting_daemon_pid();
     reap_stranded_after(continuity_pid)
 }
 
@@ -435,6 +441,17 @@ fn answering_daemon_outcome(continuity_pid: Option<u32>, holder_pid: Option<u32>
         // that live record is the only continuity token available for them.
         (Some(_), None) => DaemonStartup::Reused,
         _ => DaemonStartup::Spawned,
+    }
+}
+
+fn initial_answer_outcome(continuity_pid: Option<u32>, holder_pid: Option<u32>) -> DaemonStartup {
+    // This handshake completed before this launcher tried to spawn a daemon.
+    // Without a PID record (or, on Windows, a readable singleton holder), the
+    // answering daemon is still the one this launch found already running.
+    if continuity_pid.is_none() {
+        DaemonStartup::Reused
+    } else {
+        answering_daemon_outcome(continuity_pid, holder_pid)
     }
 }
 
@@ -1409,7 +1426,7 @@ mod exe_name_tests {
     }
 
     #[test]
-    fn only_the_preexisting_pane_owner_surviving_the_grace_counts_as_reused() {
+    fn initial_answers_reuse_the_daemon_even_without_a_pidfile() {
         assert_eq!(
             answering_daemon_outcome(Some(41), Some(41)),
             DaemonStartup::Reused
@@ -1420,9 +1437,19 @@ mod exe_name_tests {
             "a concurrent launcher created a fresh daemon"
         );
         assert_eq!(
+            initial_answer_outcome(None, Some(42)),
+            DaemonStartup::Reused,
+            "an already-answering daemon is reused even when its pidfile is missing"
+        );
+        assert_eq!(
+            initial_answer_outcome(None, None),
+            DaemonStartup::Reused,
+            "Windows cannot read a singleton holder but can still connect to a live daemon"
+        );
+        assert_eq!(
             answering_daemon_outcome(None, Some(42)),
             DaemonStartup::Spawned,
-            "without a preexisting live pid, continuity is not proven"
+            "a daemon first seen during the grace may have been spawned by another launcher"
         );
         assert_eq!(
             grace_answer_outcome(Some(41), 41, Some(41)),
@@ -1433,6 +1460,11 @@ mod exe_name_tests {
             grace_answer_outcome(Some(41), 41, Some(42)),
             DaemonStartup::Spawned,
             "a new holder that takes the seat during the grace owns no old panes"
+        );
+        assert_eq!(
+            grace_answer_outcome(None, 42, Some(42)),
+            DaemonStartup::Spawned,
+            "an answer first seen during the grace does not prove old-pane continuity"
         );
     }
 
