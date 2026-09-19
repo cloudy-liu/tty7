@@ -34,6 +34,19 @@ impl WorkspaceStore {
     }
 
     pub fn claim(cx: &mut gpui::App, id: Option<WorkspaceId>) -> WorkspaceId {
+        Self::claim_with_activation(cx, id, true)
+    }
+
+    /// Claims a restored workspace without pretending its window was focused.
+    pub fn claim_in_background(cx: &mut gpui::App, id: WorkspaceId) -> WorkspaceId {
+        Self::claim_with_activation(cx, Some(id), false)
+    }
+
+    fn claim_with_activation(
+        cx: &mut gpui::App,
+        id: Option<WorkspaceId>,
+        activate: bool,
+    ) -> WorkspaceId {
         let Some(store) = Self::try_store(cx) else {
             return WorkspaceId::new();
         };
@@ -59,9 +72,11 @@ impl WorkspaceStore {
         };
         view.open = true;
         view.synced = false;
-        view.touch();
         let claimed = view.id;
-        store.views.active = Some(claimed);
+        if activate {
+            view.touch();
+            store.views.active = Some(claimed);
+        }
         store.views.save();
         claimed
     }
@@ -125,6 +140,36 @@ impl WorkspaceStore {
             log::info!("launch: restoring 1 workspace, left {detached} detached");
         }
         Some((keep, detached))
+    }
+
+    /// Respect an explicit launch with session restoration disabled.
+    ///
+    /// The daemon has already been restarted by this point, so none of these
+    /// window markers describe a live window or pane anymore. Keeping them
+    /// `open` would make a later launch mistake them for crash recovery work.
+    pub fn close_all_for_launch(cx: &mut gpui::App) {
+        let Some(store) = Self::try_store(cx) else {
+            return;
+        };
+        for view in &mut store.views.views {
+            view.open = false;
+        }
+        store.views.save();
+    }
+
+    /// A startup restore request that could not create its window is not open.
+    /// Do not touch its recency: the failure is not user activity.
+    pub fn mark_restore_open_failed(cx: &mut gpui::App, id: WorkspaceId) {
+        let Some(store) = Self::try_store(cx) else {
+            return;
+        };
+        if let Some(view) = store.views.get_mut(id) {
+            view.open = false;
+        }
+        if store.views.active == Some(id) {
+            store.views.active = None;
+        }
+        store.views.save();
     }
 
     pub fn close_window(cx: &mut gpui::App, id: WorkspaceId) {
@@ -383,6 +428,39 @@ mod tests {
             let fresh = WorkspaceStore::claim(cx, None);
             assert_ne!(fresh, on_the_machine);
             assert_eq!(WorkspaceStore::all(cx).views.len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    fn claiming_a_background_restore_does_not_change_focus_recency(cx: &mut gpui::TestAppContext) {
+        let _ = tty7_core::core::config::set_config_dir(
+            std::env::temp_dir().join(format!("tty7-session-test-{}", std::process::id())),
+        );
+        cx.update(|cx| {
+            let foreground = WindowView::default();
+            let mut background = WindowView::default();
+            background.open = false;
+            background.last_active = 7;
+            let (foreground_id, background_id) = (foreground.id, background.id);
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![foreground, background],
+                    active: Some(foreground_id),
+                },
+            );
+
+            assert_eq!(
+                WorkspaceStore::claim_in_background(cx, background_id),
+                background_id
+            );
+            let views = WorkspaceStore::all(cx);
+            assert_eq!(views.active, Some(foreground_id));
+            assert_eq!(
+                views.get(background_id).map(|view| view.last_active),
+                Some(7)
+            );
+            assert!(views.get(background_id).is_some_and(|view| view.open));
         });
     }
 

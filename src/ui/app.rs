@@ -1037,13 +1037,34 @@ impl Tty7App {
 
     pub fn for_workspace_at(
         id: Option<WorkspaceId>,
+        initial_cwd: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::for_workspace_at_with_activation(id, initial_cwd, true, window, cx)
+    }
+
+    pub(crate) fn for_workspace_in_background(
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::for_workspace_at_with_activation(Some(id), None, false, window, cx)
+    }
+
+    fn for_workspace_at_with_activation(
+        id: Option<WorkspaceId>,
         mut initial_cwd: Option<std::path::PathBuf>,
+        activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let restore = cx.global::<Config>().restore_session;
         let known = id.is_some_and(|id| WorkspaceStore::all(cx).get(id).is_some());
-        let workspace = WorkspaceStore::claim(cx, id);
+        let workspace = match (activate, id) {
+            (false, Some(id)) => WorkspaceStore::claim_in_background(cx, id),
+            _ => WorkspaceStore::claim(cx, id),
+        };
         let is_remote = WorkspaceStore::all(cx)
             .get(workspace)
             .is_some_and(|w| w.is_remote());

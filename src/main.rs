@@ -566,9 +566,9 @@ fn main() {
 
     let restore_session = config.restore_session;
     let daemon_result = if restore_session {
-        crate::daemon::spawn::ensure_running()
+        crate::daemon::spawn::ensure_running_with_outcome()
     } else {
-        crate::daemon::spawn::restart()
+        crate::daemon::spawn::restart().map(|_| crate::daemon::spawn::DaemonStartup::Spawned)
     };
     // A pathless launch that found a GUI already registered hands the request
     // to it — the GUI may be sitting in the tray with no window — and exits.
@@ -579,9 +579,13 @@ fn main() {
     if open_path.is_none() && daemon_result.is_ok() && forward_open_path(None) {
         return;
     }
-    if let Err(e) = daemon_result {
+    if let Err(e) = &daemon_result {
         log::error!("failed to ensure daemon is running: {e}");
     }
+    // Failure proves neither continuity nor replacement. The recovery planner
+    // keeps that uncertainty explicit so it can show one useful window without
+    // detaching the rest or claiming their panes are still served.
+    let daemon_startup = daemon_result.ok();
 
     gpui_platform::application()
         .with_assets(Assets)
@@ -616,9 +620,7 @@ fn main() {
             keymap::init(cx);
             crate::ui::local_link::LocalLink::install(cx);
 
-            let reopen = crate::ui::windows::restore_target(cx, open_path.as_deref());
-            crate::ui::windows::open_at(cx, reopen.map(|(id, _)| id), open_path);
-            crate::ui::windows::announce_detached_at_launch(cx, reopen);
+            crate::ui::windows::restore_at_launch(cx, daemon_startup, restore_session, open_path);
             if config_outcome.failed() {
                 notify_config_load_failed(cx, config_outcome, true);
             }
