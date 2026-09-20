@@ -10083,6 +10083,7 @@ mod ssh_rebuild_gpui_tests {
                 id: app.tabs[0].tree_id.get(),
                 name: None,
                 sidebar_group: None,
+                focused_pane: Some(1),
                 root: PaneNode::Leaf { pane: 1 },
             };
             app.apply_layout_delta(
