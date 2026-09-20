@@ -79,6 +79,7 @@
             "pages": [
               "customization/settings",
               "customization/themes",
+              "customization/markdown-themes",
               "customization/fonts",
               "customization/keybindings"
             ]

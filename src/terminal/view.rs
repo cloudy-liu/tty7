@@ -6268,13 +6268,15 @@ impl Render for TerminalView {
                 self.terminal.write(bytes);
             }
             self.typeahead.drain();
-        } else if self.input_active() {
+        } else if self.terminal.zle_reading() && self.input_active() {
+            // The prompt report can arrive before its vi-mode and prompt-end
+            // marks. Keep the gap pending until those marks establish which
+            // editor owns it; consuming it earlier strands it in `cmd` when
+            // the next output frame hands the prompt to the shell.
             if let Some(net) = self.hold.engage() {
                 self.cmd.prepend_str(&net);
             }
-            if self.terminal.zle_reading() {
-                self.flush_typeahead();
-            }
+            self.flush_typeahead();
         }
         let entity = cx.entity();
         let search_bar = self
@@ -10487,16 +10489,29 @@ mod gpui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         window
-            .update(cx, |view, _, cx| view.commit_text("ls", cx))
+            .update(cx, |view, _, cx| {
+                assert!(view.terminal.shell_active() && !view.terminal.at_prompt());
+                view.commit_text("ls", cx);
+            })
             .unwrap();
 
-        DaemonMsg::Prompt {
-            active: true,
-            at_prompt: true,
-            last_exit: Some(0),
-        }
-        .encode(&mut daemon)
-        .unwrap();
+        prompt_ready(&window, cx, &mut daemon);
+        // Force a frame between the prompt report and its mode/end marks.
+        // Depending on socket batching used to hide the premature transfer
+        // of the held text into the editor on most runs.
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        window
+            .update(cx, |view, _, _| {
+                assert!(!view.terminal.zle_reading());
+                assert!(
+                    view.cmd.is_empty(),
+                    "gap text must wait until the prompt's input mode is known"
+                );
+            })
+            .unwrap();
         DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
             .encode(&mut daemon)
             .unwrap();
@@ -10512,6 +10527,11 @@ mod gpui_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.terminal.shell_vi_mode() && view.terminal.zle_reading());
+            })
+            .unwrap();
         cx.executor().advance_clock(HOLD_WINDOW * 2);
         cx.run_until_parked();
         assert_eq!(

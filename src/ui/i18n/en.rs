@@ -175,6 +175,17 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsAnsiColors => "ANSI colors",
         L10nKey::SettingsCustomThemes => "Custom themes",
         L10nKey::SettingsThemesRejected => "Not loaded from the themes folder",
+        L10nKey::SettingsMarkdownTheme => "Markdown reading theme",
+        L10nKey::SettingsMarkdownThemeDesc => {
+            "Choose a reading style. Its light and dark colors follow the app. Theme file changes apply automatically."
+        }
+        L10nKey::SettingsMarkdownThemeUnavailable => {
+            "Could not load {requested}. Currently using {active}. The selected theme will return when its file is repaired."
+        }
+        L10nKey::SettingsMarkdownThemeBuiltin => "Built-in",
+        L10nKey::SettingsMarkdownThemeUser => "Custom",
+        L10nKey::EditorCopyCode => "Copy code",
+        L10nKey::MarkdownAnchorMissing => "heading not found",
         L10nKey::ThemeDuplicateFailed => "Could not duplicate the theme",
         L10nKey::ThemeSaveFailed => "Could not save the theme",
         L10nKey::OpenInFileManagerFailed => "Could not open {path}",

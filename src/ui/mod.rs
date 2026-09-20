@@ -17,6 +17,7 @@ pub mod i18n;
 pub mod keymap;
 pub mod local_link;
 pub mod machine_mirror;
+pub mod markdown_preview;
 pub mod palette;
 pub mod pane;
 pub mod pane_drag;
