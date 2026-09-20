@@ -105,8 +105,22 @@ mod tests {
     }
 
     #[test]
-    fn herdr_icon_resolves() {
-        assert!(Assets.load("icons/herdr.svg").unwrap().is_some());
+    fn herdr_avatar_keeps_its_dark_and_lavender_colors() {
+        let bytes = Assets.load("icons/herdr.svg").unwrap().unwrap();
+        let image = gpui::SvgRenderer::new(std::sync::Arc::new(Assets))
+            .render_single_frame(&bytes, 1.0)
+            .unwrap();
+        let pixels = image.as_bytes(0).unwrap();
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|p| p == [0x27, 0x1b, 0x1b, 0xff])
+        );
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|p| p == [0xf5, 0xca, 0xc1, 0xff])
+        );
     }
 
     #[test]

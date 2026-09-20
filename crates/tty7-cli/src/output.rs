@@ -478,6 +478,9 @@ mod tests {
                 cwd: None,
                 agent: None,
                 status: None,
+                focused_agent: None,
+                focused_status: None,
+                foreground_app: None,
                 live: true,
                 panes: 1,
             };

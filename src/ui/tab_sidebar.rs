@@ -281,7 +281,7 @@ impl Tty7App {
                 let tab = &self.tabs[i];
                 let is_active = i == active;
                 let ssh_dot = self.tab_ssh_dot(tab, cx);
-                let agent_badge = tab.focused_agent_badge(window, cx);
+                let agent_badge = tab.focused_agent_badge(Some(window), cx);
                 let agent = agent_badge.agent;
                 let avatar = TabAvatar::choose(agent, tab.foreground_app(Some(window), cx));
                 let agent_status = agent_badge.status;

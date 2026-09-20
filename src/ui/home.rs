@@ -340,6 +340,7 @@ mod tests {
             name: Some("build".into()),
             tree_id: None,
             sidebar_group: None,
+            focused_pane: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("build"));
@@ -351,6 +352,7 @@ mod tests {
             name: None,
             tree_id: None,
             sidebar_group: None,
+            focused_pane: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("getty"));
@@ -359,6 +361,7 @@ mod tests {
             name: Some("   ".into()),
             tree_id: None,
             sidebar_group: None,
+            focused_pane: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("getty"));
@@ -370,6 +373,7 @@ mod tests {
             name: None,
             tree_id: None,
             sidebar_group: None,
+            focused_pane: None,
             pane: SessionPane::Split {
                 axis: crate::core::session::SessionAxis::Horizontal,
                 ratio: 0.5,
@@ -386,6 +390,7 @@ mod tests {
             name: None,
             tree_id: None,
             sidebar_group: None,
+            focused_pane: None,
             pane: leaf(None),
         };
         assert_eq!(closed_tab_label(&unnamed), None);
@@ -393,6 +398,7 @@ mod tests {
             name: None,
             tree_id: None,
             sidebar_group: None,
+            focused_pane: None,
             pane: leaf(Some("/")),
         };
         assert_eq!(closed_tab_label(&root), None);
@@ -404,6 +410,7 @@ mod tests {
             name: Some("a".repeat(40)),
             tree_id: None,
             sidebar_group: None,
+            focused_pane: None,
             pane: leaf(None),
         };
         let label = closed_tab_label(&tab).unwrap();

@@ -47,8 +47,8 @@ impl TabAvatar {
         app: Option<crate::core::foreground_app::ForegroundApp>,
     ) -> Self {
         match (agent, app) {
-            (Some(agent), _) => Self::Agent(agent),
-            (None, Some(app)) => Self::App(app),
+            (_, Some(app)) => Self::App(app),
+            (Some(agent), None) => Self::Agent(agent),
             (None, None) => Self::Terminal,
         }
     }
@@ -1218,12 +1218,19 @@ impl Tty7App {
                     })
                     .into_any_element()
             }
-            TabAvatar::App(crate::core::foreground_app::ForegroundApp::Herdr) => base
-                .child(gpui::svg().path("icons/herdr.svg").size(px(size * 0.78)))
-                .tooltip(|window, cx| {
-                    gpui_component::tooltip::Tooltip::new("Herdr").build(window, cx)
-                })
-                .into_any_element(),
+            TabAvatar::App(crate::core::foreground_app::ForegroundApp::Herdr) => {
+                let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
+                let dot = status
+                    .and_then(|s| s.dot_rgb())
+                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background, hollow));
+                base.relative()
+                    .child(gpui::img("icons/herdr.svg").size(px(size)).rounded_full())
+                    .when_some(dot, |b, dot| b.child(dot))
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new("Herdr").build(window, cx)
+                    })
+                    .into_any_element()
+            }
             TabAvatar::Terminal => base
                 .relative()
                 .rounded_full()
@@ -1629,7 +1636,7 @@ impl Tty7App {
             let label = self.tab_label(tab, i, Some(window), cx);
             let full_title = self.tab_title_tooltip(tab, i, Some(window), cx);
             let ssh_dot = self.tab_ssh_dot(tab, cx);
-            let agent_badge = tab.focused_agent_badge(window, cx);
+            let agent_badge = tab.focused_agent_badge(Some(window), cx);
             let agent = agent_badge.agent;
             let avatar = TabAvatar::choose(agent, tab.foreground_app(Some(window), cx));
             let agent_status = agent_badge.status;
@@ -1952,13 +1959,17 @@ mod tests {
     }
 
     #[test]
-    fn avatar_identity_prefers_an_agent_over_the_host_app() {
+    fn avatar_identity_prefers_the_host_app_over_a_nested_agent() {
         use crate::core::cli_agent::CLIAgent;
         use crate::core::foreground_app::ForegroundApp;
 
         assert_eq!(
             super::TabAvatar::choose(Some(CLIAgent::Codex), Some(ForegroundApp::Herdr)),
-            super::TabAvatar::Agent(CLIAgent::Codex)
+            super::TabAvatar::App(ForegroundApp::Herdr)
+        );
+        assert_eq!(
+            super::TabAvatar::choose(Some(CLIAgent::Claude), Some(ForegroundApp::Herdr)),
+            super::TabAvatar::App(ForegroundApp::Herdr)
         );
         assert_eq!(
             super::TabAvatar::choose(None, Some(ForegroundApp::Herdr)),

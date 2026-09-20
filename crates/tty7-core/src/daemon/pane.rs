@@ -2990,6 +2990,7 @@ fn apply_foreground_app(
 ) {
     if st.foreground_app != app {
         st.foreground_app = app;
+        crate::core::machine::observe_pane(st.id, |record| record.foreground_app = app);
         notify(st, DaemonMsg::ForegroundApp(app));
     }
 }

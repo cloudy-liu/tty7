@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::core::cli_agent::CLIAgent;
+use crate::core::foreground_app::ForegroundApp;
 use crate::core::session::WorkspaceId;
 use crate::daemon::protocol::{NativeSshSpec, ShellSpec};
 
@@ -135,6 +136,9 @@ pub struct Tab {
     pub name: Option<String>,
     #[serde(default)]
     pub sidebar_group: Option<String>,
+    /// Last focused pane. Old trees without this field use the first leaf.
+    #[serde(default)]
+    pub focused_pane: Option<u64>,
     pub root: PaneNode,
 }
 
@@ -144,6 +148,7 @@ impl Tab {
             id: TabId::new(),
             name: None,
             sidebar_group: None,
+            focused_pane: Some(pane),
             root: PaneNode::Leaf { pane },
         }
     }
@@ -288,6 +293,8 @@ pub struct PaneRecord {
     pub ssh_spec: Option<Box<NativeSshSpec>>,
     #[serde(default)]
     pub agent: Option<AgentFacts>,
+    #[serde(default)]
+    pub foreground_app: Option<ForegroundApp>,
     /// What the pane is actually running, resolved: the spawn's override if it
     /// had one, otherwise the shell the config named at the time.
     ///
@@ -310,6 +317,7 @@ impl PaneRecord {
             osc_title: None,
             ssh_spec: None,
             agent: None,
+            foreground_app: None,
             shell: None,
             live: false,
         }
@@ -376,6 +384,7 @@ impl PaneSeed {
             osc_title: None,
             ssh_spec: self.ssh_spec.map(|s| Box::new(s.without_secrets())),
             agent: self.agent,
+            foreground_app: None,
             shell: self.shell,
             live,
         }
@@ -408,6 +417,10 @@ pub enum LayoutDelta {
     TabRenamed {
         tab: TabId,
         name: Option<String>,
+    },
+    TabFocused {
+        tab: TabId,
+        pane: u64,
     },
     TabMoved {
         tab: TabId,
@@ -710,6 +723,26 @@ impl MachineStore {
             let t = find_tab(m, workspace, tab)?;
             t.name = name.clone();
             Ok(((), vec![(workspace, LayoutDelta::TabRenamed { tab, name })]))
+        })
+    }
+
+    pub fn tab_focus_pane(
+        &self,
+        workspace: WorkspaceId,
+        tab: TabId,
+        pane: u64,
+        origin: Option<SubscriberId>,
+    ) -> io::Result<()> {
+        self.mutate(origin, |m| {
+            let t = find_tab(m, workspace, tab)?;
+            if !t.root.contains(pane) {
+                return Err(not_found(format!("tab {tab} has no pane {pane}")));
+            }
+            if t.focused_pane == Some(pane) {
+                return Ok(((), Vec::new()));
+            }
+            t.focused_pane = Some(pane);
+            Ok(((), vec![(workspace, LayoutDelta::TabFocused { tab, pane })]))
         })
     }
 
@@ -1974,6 +2007,25 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_remembers_its_focused_pane_across_restart() {
+        let (store, dir, ws, tab) = store_with_tab();
+        store
+            .pane_split(ws, 1, Axis::Horizontal, 0.5, seed(2, "/other"), false, None)
+            .unwrap();
+        store.tab_focus_pane(ws, tab.id, 2, None).unwrap();
+        assert_eq!(store.workspace(ws).unwrap().tabs[0].focused_pane, Some(2));
+
+        let reopened = MachineStore::open(dir.path().join(MACHINE_FILE));
+        assert_eq!(
+            reopened.workspace(ws).unwrap().tabs[0].focused_pane,
+            Some(2)
+        );
+
+        assert!(store.tab_focus_pane(ws, tab.id, 99, None).is_err());
+        assert_eq!(store.workspace(ws).unwrap().tabs[0].focused_pane, Some(2));
+    }
+
+    #[test]
     fn splitting_and_closing_panes_reshapes_the_tree() {
         let (store, _dir, ws, tab) = store_with_tab();
         store
@@ -2585,6 +2637,7 @@ mod tests {
                 .expect("missing fields default rather than fail");
         assert_eq!(machine.workspaces.len(), 1);
         assert_eq!(machine.workspaces[0].tabs[0].root.pane_ids(), vec![3]);
+        assert_eq!(machine.workspaces[0].tabs[0].focused_pane, None);
         assert!(machine.panes.is_empty());
     }
 }

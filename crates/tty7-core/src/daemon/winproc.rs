@@ -837,6 +837,12 @@ mod tests {
             p(400, 300, "codex.exe"),
         ];
         assert_eq!(foreground_app(&procs, 100), Some(ForegroundApp::Herdr));
+        assert_eq!(
+            detect_foreground_agent_with(&procs, 100, |_| None, &std::collections::HashMap::new(),)
+                .map(|(agent, _)| agent),
+            Some(CLIAgent::Codex),
+            "Herdr and its nested agent can both be reported for one pane"
+        );
         assert_eq!(foreground_app(&procs, 300), None);
         assert_eq!(foreground_app(&[p(100, 1, "cmd.exe")], 100), None);
         assert_eq!(

@@ -56,6 +56,8 @@ pub struct SessionTab {
     pub pane: SessionPane,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_group: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane: Option<u64>,
     #[serde(skip)]
     pub tree_id: Option<crate::core::machine::TabId>,
 }

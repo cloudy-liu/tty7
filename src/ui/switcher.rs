@@ -917,6 +917,7 @@ impl Tty7App {
                 .map(|i| {
                     let tab = &self.tabs[i];
                     let agent_row = tab.agent_row(cx);
+                    let focused = tab.focused_agent_badge(None, cx);
                     TabRow {
                         id: tab.tree_id.get(),
                         index: i,
@@ -933,12 +934,9 @@ impl Tty7App {
                             })
                             .map(|(p, home)| crate::ui::home::display_path(&p, home.as_deref()))
                             .unwrap_or_default(),
-                        avatar: TabAvatar::choose(
-                            agent_row.map(|(agent, _)| agent),
-                            tab.foreground_app(None, cx),
-                        ),
-                        status: agent_row.map(|(_, status)| status),
-                        unread: tab.agent_unread_count(cx),
+                        avatar: TabAvatar::choose(focused.agent, tab.foreground_app(None, cx)),
+                        status: focused.status,
+                        unread: focused.unread,
                         ssh: self.tab_ssh_dot(tab, cx),
                         active: i == self.active,
                         git: tab.git_status(None, cx),
@@ -981,8 +979,8 @@ impl Tty7App {
                         crate::ui::home::display_path(std::path::Path::new(p), home.as_deref())
                     })
                     .unwrap_or_default(),
-                avatar: TabAvatar::choose(v.agent, None),
-                status: v.status,
+                avatar: TabAvatar::choose(v.focused_agent, v.foreground_app),
+                status: v.focused_status,
                 unread: 0,
                 ssh: None,
                 active: Some(v.id) == active,
@@ -3640,6 +3638,9 @@ mod tests {
             cwd: Some("/Users/x/repo/tty7".to_string()),
             agent: Some(crate::core::cli_agent::CLIAgent::Claude),
             status: None,
+            focused_agent: None,
+            focused_status: None,
+            foreground_app: None,
             live: true,
             panes: 1,
         };

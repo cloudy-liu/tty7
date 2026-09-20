@@ -11,12 +11,14 @@ pub fn two_workspace_machine() -> Machine {
                 id: TabId::new(),
                 name: Some("build".into()),
                 sidebar_group: None,
+                focused_pane: Some(1),
                 root: PaneNode::Leaf { pane: 1 },
             },
             Tab {
                 id: TabId::new(),
                 name: None,
                 sidebar_group: None,
+                focused_pane: Some(2),
                 root: PaneNode::Split {
                     axis: Axis::Horizontal,
                     ratio: 0.5,
@@ -36,6 +38,7 @@ pub fn two_workspace_machine() -> Machine {
             id: TabId::new(),
             name: None,
             sidebar_group: None,
+            focused_pane: Some(5),
             root: PaneNode::Leaf { pane: 5 },
         }],
         active_tab: None,
@@ -48,6 +51,7 @@ pub fn two_workspace_machine() -> Machine {
         osc_title: None,
         ssh_spec: None,
         agent: None,
+        foreground_app: None,
         shell: None,
         live: true,
     };

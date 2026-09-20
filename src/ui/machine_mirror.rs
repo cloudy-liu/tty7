@@ -299,6 +299,13 @@ fn apply(machine: &mut Machine, workspace: WorkspaceId, delta: &LayoutDelta) -> 
             t.name = name.clone();
             true
         }
+        LayoutDelta::TabFocused { tab, pane } => {
+            let Some(t) = ws.tabs.iter_mut().find(|t| t.id == *tab) else {
+                return false;
+            };
+            t.focused_pane = Some(*pane);
+            true
+        }
         LayoutDelta::TabRegrouped { tab, group } => {
             let Some(t) = ws.tabs.iter_mut().find(|t| t.id == *tab) else {
                 return false;
@@ -919,6 +926,7 @@ mod tests {
             id: tab_id,
             name: None,
             sidebar_group: None,
+            focused_pane: Some(1),
             root: PaneNode::Split {
                 axis: Axis::Vertical,
                 ratio: 0.5,
@@ -934,8 +942,17 @@ mod tests {
                 pane: Some(PaneRecord::new(2)),
             },
         ));
+        assert!(apply(
+            &mut machine,
+            id,
+            &LayoutDelta::TabFocused {
+                tab: tab_id,
+                pane: 2,
+            },
+        ));
         let ws = &machine.workspaces[0];
         assert_eq!(ws.tabs[0].root.pane_ids(), vec![1, 2]);
+        assert_eq!(ws.tabs[0].focused_pane, Some(2));
         assert_eq!(
             machine.panes.len(),
             1,
@@ -989,6 +1006,7 @@ mod tests {
         let mut machine = Machine::default();
         let mut record = PaneRecord::new(7);
         record.cwd = Some("/work".into());
+        record.foreground_app = Some(crate::core::foreground_app::ForegroundApp::Herdr);
         assert!(apply(
             &mut machine,
             WorkspaceId::new(),
@@ -1004,6 +1022,10 @@ mod tests {
         ));
         assert_eq!(machine.panes.len(), 1, "updated in place, not duplicated");
         assert!(machine.panes[0].live);
+        assert_eq!(
+            machine.panes[0].foreground_app,
+            Some(crate::core::foreground_app::ForegroundApp::Herdr)
+        );
     }
 
     #[test]
