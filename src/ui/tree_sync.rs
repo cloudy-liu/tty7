@@ -63,6 +63,7 @@ pub(crate) struct DesiredTab {
     pub id: TabId,
     pub name: Option<String>,
     pub group: Option<String>,
+    pub focused_pane: Option<u64>,
     pub root: DesiredNode,
 }
 
@@ -137,6 +138,7 @@ pub(crate) fn desired_tabs(
                 .borrow()
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            focused_pane: tab.focused_pane_id(cx),
             root,
         });
     }
@@ -319,6 +321,25 @@ pub(crate) fn diff(
             SyncScope::Additive => mirror.tabs.len(),
         };
         create_tab(workspace, mirror, at, want, &mut ops);
+    }
+
+    // Focus follows structural changes: the selected pane may have just been
+    // created by a split or moved from another tab.
+    for want in desired {
+        let Some(pane) = want.focused_pane else {
+            continue;
+        };
+        let Some(tab) = mirror.tabs.iter_mut().find(|t| t.id == want.id) else {
+            continue;
+        };
+        if tab.root.contains(pane) && tab.focused_pane != Some(pane) {
+            tab.focused_pane = Some(pane);
+            ops.push(ControlRequest::TabFocusPane {
+                workspace,
+                tab: want.id,
+                pane,
+            });
+        }
     }
 
     if scope == SyncScope::Additive || !held.is_empty() {
@@ -519,6 +540,7 @@ fn create_tab(
             id: want.id,
             name: want.name.clone(),
             sidebar_group: want.group.clone(),
+            focused_pane: Some(*first),
             root,
         },
     );
@@ -1524,6 +1546,7 @@ pub(crate) fn session_from_tree(
             name: tab.name.clone(),
             tree_id: Some(tab.id),
             sidebar_group: tab.sidebar_group.clone().map(std::path::PathBuf::from),
+            focused_pane: tab.focused_pane,
             pane: session_pane_from_node(&tab.root, panes),
         })
         .collect();
@@ -2331,6 +2354,13 @@ fn apply_to_mirror(mirror: &mut WsMirror, delta: &LayoutDelta) -> bool {
             t.name = name.clone();
             true
         }
+        LayoutDelta::TabFocused { tab, pane } => {
+            let Some(t) = mirror.tabs.iter_mut().find(|t| t.id == *tab) else {
+                return false;
+            };
+            t.focused_pane = Some(*pane);
+            true
+        }
         LayoutDelta::TabRegrouped { tab, group } => {
             let Some(t) = mirror.tabs.iter_mut().find(|t| t.id == *tab) else {
                 return false;
@@ -2491,6 +2521,12 @@ impl Tty7App {
                 }
                 true
             }
+            LayoutDelta::TabFocused { tab, pane } => {
+                if let Some(index) = index_of(&self.tabs, *tab) {
+                    self.tabs[index].remember_tree_focus(Some(*pane), cx);
+                }
+                true
+            }
             LayoutDelta::TabRegrouped { tab, group } => {
                 if let Some(index) = index_of(&self.tabs, *tab) {
                     *self.tabs[index].sidebar_group.borrow_mut() =
@@ -2555,7 +2591,7 @@ impl Tty7App {
         let Some(pane) = self.build_pane_from_tree(&tab.root, &mut existing, window, cx) else {
             return false;
         };
-        let gui = crate::ui::app::Tab::from_tree(tab, pane);
+        let gui = crate::ui::app::Tab::from_tree(tab, pane, cx);
         self.tabs.insert(at, gui);
         if self.active >= at && self.tabs.len() > 1 {
             self.active += 1;
@@ -2596,6 +2632,7 @@ impl Tty7App {
         });
         let gui = &mut self.tabs[index];
         gui.pane = pane;
+        gui.remember_tree_focus(tab.focused_pane, cx);
         gui.name = tab.name.clone();
         *gui.sidebar_group.borrow_mut() = tab.sidebar_group.clone().map(std::path::PathBuf::from);
         self.maximized = None;
@@ -3105,6 +3142,7 @@ mod tests {
                 id: TabId::new(),
                 name: None,
                 sidebar_group: None,
+                focused_pane: Some(1),
                 root: PaneNode::Leaf { pane: 1 },
             };
 
@@ -3735,12 +3773,14 @@ mod tests {
                             id: put_up,
                             name: None,
                             sidebar_group: None,
+                            focused_pane: Some(1),
                             root: PaneNode::Leaf { pane: 1 },
                         },
                         TreeTab {
                             id: failed,
                             name: None,
                             sidebar_group: None,
+                            focused_pane: Some(2),
                             root: PaneNode::Leaf { pane: 2 },
                         },
                     ],
@@ -3826,12 +3866,14 @@ mod tests {
                             id: theirs.0,
                             name: None,
                             sidebar_group: None,
+                            focused_pane: Some(11),
                             root: PaneNode::Leaf { pane: 11 },
                         },
                         TreeTab {
                             id: theirs.1,
                             name: None,
                             sidebar_group: None,
+                            focused_pane: Some(12),
                             root: PaneNode::Leaf { pane: 12 },
                         },
                     ],
@@ -3961,8 +4003,42 @@ mod tests {
             id,
             name: None,
             group: None,
+            focused_pane: None,
             root,
         }
+    }
+
+    #[test]
+    fn a_newly_focused_split_is_recorded_after_it_exists() {
+        let workspace = WorkspaceId::new();
+        let id = TabId::new();
+        let mut existing = TreeTab::leaf(1);
+        existing.id = id;
+        let mut mirror = WsMirror {
+            tabs: vec![existing],
+            active: Some(id),
+        };
+        let mut wanted = tab(id, split(TreeAxis::Horizontal, 0.5, leaf(1), leaf(2)));
+        wanted.focused_pane = Some(2);
+
+        let ops = diff(
+            workspace,
+            &mut mirror,
+            &[wanted],
+            Some(id),
+            SyncScope::Full,
+            &[],
+        );
+        let split = ops
+            .iter()
+            .position(|op| matches!(op, ControlRequest::PaneSplit { new, .. } if new.pane == 2))
+            .expect("the split is sent");
+        let focus = ops
+            .iter()
+            .position(|op| matches!(op, ControlRequest::TabFocusPane { pane: 2, .. }))
+            .expect("focus is sent");
+        assert!(split < focus);
+        assert_eq!(mirror.tabs[0].focused_pane, Some(2));
     }
 
     #[test]
@@ -4625,6 +4701,7 @@ mod tests {
             id,
             name: None,
             sidebar_group: None,
+            focused_pane: Some(1),
             root: PaneNode::Leaf { pane: 1 },
         };
         assert!(apply_to_mirror(
@@ -4645,6 +4722,7 @@ mod tests {
                     id,
                     name: None,
                     sidebar_group: None,
+                    focused_pane: Some(1),
                     root: PaneNode::Split {
                         axis: TreeAxis::Vertical,
                         ratio: 0.5,
@@ -4714,6 +4792,7 @@ mod tests {
                 id: tab_id,
                 name: Some("build".into()),
                 sidebar_group: Some("/repo".into()),
+                focused_pane: Some(2),
                 root: PaneNode::Split {
                     axis: TreeAxis::Vertical,
                     ratio: 0.3,
@@ -4757,6 +4836,7 @@ mod tests {
             "the daemon tab's identity rides along"
         );
         assert_eq!(tab.name.as_deref(), Some("build"));
+        assert_eq!(tab.focused_pane, Some(2));
         let SessionPane::Split { ratio, a, b, .. } = &tab.pane else {
             panic!("the split survives the lowering");
         };
@@ -4811,6 +4891,7 @@ mod tests {
                 id: tab_id,
                 name: None,
                 sidebar_group: None,
+                focused_pane: Some(7),
                 root: PaneNode::Leaf { pane: 7 },
             }],
             active_tab: Some(tab_id),
@@ -4840,6 +4921,7 @@ mod tests {
                 id: TabId::new(),
                 name: None,
                 sidebar_group: None,
+                focused_pane: Some(1),
                 root: PaneNode::Leaf { pane: 1 },
             }],
             active_tab: Some(TabId::new()),

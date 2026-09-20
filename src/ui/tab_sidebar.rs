@@ -21,7 +21,7 @@ use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
 use crate::ui::right_panel::RESIZE_HANDLE_WIDTH;
 use crate::ui::tab_strip::{
-    DragTab, REORDER_SLIDE_MS, abbreviate_home, elide_keep_edges, elide_label,
+    DragTab, REORDER_SLIDE_MS, TabAvatar, abbreviate_home, elide_keep_edges, elide_label,
     elide_path_keep_tail, measure_text, strip_host_prefix,
 };
 
@@ -281,8 +281,9 @@ impl Tty7App {
                 let tab = &self.tabs[i];
                 let is_active = i == active;
                 let ssh_dot = self.tab_ssh_dot(tab, cx);
-                let agent_badge = tab.focused_agent_badge(window, cx);
+                let agent_badge = tab.focused_agent_badge(Some(window), cx);
                 let agent = agent_badge.agent;
+                let avatar = TabAvatar::choose(agent, tab.foreground_app(Some(window), cx));
                 let agent_status = agent_badge.status;
                 let agent_unread = agent_badge.unread;
                 let git_cwd = diff_click_cwd(
@@ -718,7 +719,7 @@ impl Tty7App {
                     }))
                     .child(self.tab_avatar(
                         ("sidebar-avatar", i),
-                        agent,
+                        avatar,
                         agent_status,
                         agent_unread,
                         ssh_dot,

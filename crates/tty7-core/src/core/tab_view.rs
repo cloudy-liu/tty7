@@ -7,6 +7,7 @@
 //! the CLI and the GUI name a tab the same way.
 
 use crate::core::cli_agent::{AgentStatus, CLIAgent};
+use crate::core::foreground_app::ForegroundApp;
 use crate::core::machine::{PaneRecord, TabId, Workspace};
 
 /// Deliberately not serialisable: it is a reading of the machine tree, and
@@ -25,6 +26,10 @@ pub struct TabView {
     pub cwd: Option<String>,
     pub agent: Option<CLIAgent>,
     pub status: Option<AgentStatus>,
+    /// Identity and status of the last focused pane, used for navigation.
+    pub focused_agent: Option<CLIAgent>,
+    pub focused_status: Option<AgentStatus>,
+    pub foreground_app: Option<ForegroundApp>,
     pub live: bool,
     pub panes: usize,
 }
@@ -131,10 +136,13 @@ pub fn tab_views_of(ws: &Workspace, panes: &[PaneRecord]) -> Vec<TabView> {
                 .iter()
                 .filter_map(|id| panes.iter().find(|p| p.id == *id))
                 .collect();
-            // The first pane stands in for the tab, the same way the strip shows
-            // its focused leaf — but any pane running an agent wins, since that
-            // is what someone scanning the list is looking for.
+            // Labels keep their existing first-pane and any-agent rules. The
+            // avatar follows the saved focus, falling back to the first pane.
             let head = records.first();
+            let focused = tab
+                .focused_pane
+                .and_then(|id| records.iter().copied().find(|p| p.id == id))
+                .or(head.copied());
             let facts = records.iter().find_map(|p| p.agent.as_ref());
             // The title follows the agent for the same reason the facts do: an
             // agent's pane titles itself with what it is working on, while a
@@ -150,6 +158,13 @@ pub fn tab_views_of(ws: &Workspace, panes: &[PaneRecord]) -> Vec<TabView> {
                 cwd: head.and_then(|p| p.cwd.clone()),
                 agent: facts.map(|f| f.agent),
                 status: facts.and_then(|f| f.status),
+                focused_agent: focused.and_then(|p| p.agent.as_ref().map(|a| a.agent)),
+                focused_status: focused.and_then(|p| {
+                    p.agent
+                        .as_ref()
+                        .map(|a| a.status.unwrap_or(AgentStatus::Idle))
+                }),
+                foreground_app: focused.and_then(|p| p.foreground_app),
                 live: records.iter().any(|p| p.live),
                 panes: ids.len(),
             }
@@ -171,6 +186,9 @@ mod tests {
             cwd: None,
             agent: None,
             status: None,
+            focused_agent: None,
+            focused_status: None,
+            foreground_app: None,
             live: true,
             panes: 1,
         }
@@ -269,6 +287,7 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].cwd.as_deref(), Some("/work"));
         assert_eq!(views[0].agent, Some(CLIAgent::Claude));
+        assert_eq!(views[0].focused_agent, None);
         assert_eq!(views[0].panes, 2);
         assert!(views[0].live, "one live pane makes the tab live");
         assert_eq!(
@@ -276,6 +295,50 @@ mod tests {
             Some("✳ fixing the switcher"),
             "the agent's pane names the tab, not the shell in front of it"
         );
+    }
+
+    #[test]
+    fn avatar_facts_follow_the_last_focused_pane_with_a_legacy_fallback() {
+        use crate::core::machine::{Axis, PaneNode};
+
+        let mut tab = Tab::leaf(1);
+        tab.root = PaneNode::Split {
+            axis: Axis::Horizontal,
+            ratio: 0.5,
+            a: Box::new(PaneNode::Leaf { pane: 1 }),
+            b: Box::new(PaneNode::Leaf { pane: 2 }),
+        };
+        tab.focused_pane = Some(2);
+        let mut ws = Workspace::default();
+        ws.tabs.push(tab);
+        let panes = vec![
+            PaneRecord::new(1),
+            PaneRecord {
+                foreground_app: Some(ForegroundApp::Herdr),
+                agent: Some(AgentFacts {
+                    agent: CLIAgent::Codex,
+                    status: Some(AgentStatus::Working),
+                    session_id: None,
+                    launch_argv: None,
+                    restore_pending: false,
+                    unstarted: false,
+                }),
+                ..PaneRecord::new(2)
+            },
+        ];
+        let views = tab_views_of(&ws, &panes);
+        let focused = &views[0];
+        assert_eq!(focused.foreground_app, Some(ForegroundApp::Herdr));
+        assert_eq!(focused.focused_agent, Some(CLIAgent::Codex));
+        assert_eq!(focused.focused_status, Some(AgentStatus::Working));
+
+        ws.tabs[0].focused_pane = None;
+        let views = tab_views_of(&ws, &panes);
+        let legacy = &views[0];
+        assert_eq!(legacy.foreground_app, None);
+        assert_eq!(legacy.focused_agent, None);
+        ws.tabs[0].focused_pane = Some(99);
+        assert_eq!(tab_views_of(&ws, &panes)[0].focused_agent, None);
     }
 
     #[test]

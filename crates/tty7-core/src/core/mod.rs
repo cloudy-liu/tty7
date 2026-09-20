@@ -3,6 +3,7 @@ pub mod cli_agent;
 pub mod codename;
 pub mod config;
 pub mod crash;
+pub mod foreground_app;
 pub mod git;
 pub mod gitignore;
 #[allow(dead_code)]

@@ -751,6 +751,15 @@ fn run_request(
                 .tab_rename(workspace, tab, name, conn.machine_origin)?;
             (ReplyOk::Unit, Vec::new())
         }
+        ControlRequest::TabFocusPane {
+            workspace,
+            tab,
+            pane,
+        } => {
+            conn.machine()?
+                .tab_focus_pane(workspace, tab, pane, conn.machine_origin)?;
+            (ReplyOk::Unit, Vec::new())
+        }
         ControlRequest::TabMove { workspace, tab, to } => {
             conn.machine()?
                 .tab_move(workspace, tab, clamp_usize(to), conn.machine_origin)?;

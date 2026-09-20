@@ -47,6 +47,7 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/machine-local.svg" => include_bytes!("../../assets/icons/machine-local.svg"),
         "icons/machine-remote.svg" => include_bytes!("../../assets/icons/machine-remote.svg"),
         "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
+        "icons/herdr.svg" => include_bytes!("../../assets/icons/herdr.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
         "icons/agents/gemini.svg" => include_bytes!("../../assets/icons/agents/gemini.svg"),
@@ -101,6 +102,25 @@ mod tests {
                 agent.display_name()
             );
         }
+    }
+
+    #[test]
+    fn herdr_avatar_keeps_its_dark_and_lavender_colors() {
+        let bytes = Assets.load("icons/herdr.svg").unwrap().unwrap();
+        let image = gpui::SvgRenderer::new(std::sync::Arc::new(Assets))
+            .render_single_frame(&bytes, 1.0)
+            .unwrap();
+        let pixels = image.as_bytes(0).unwrap();
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|p| p == [0x27, 0x1b, 0x1b, 0xff])
+        );
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|p| p == [0xf5, 0xca, 0xc1, 0xff])
+        );
     }
 
     #[test]

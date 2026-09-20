@@ -10,7 +10,7 @@ use std::time::Duration;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::core::kitty_graphics::{GraphicsSniffer, Segment, Sniffed};
-use crate::core::osc::OscTokenizer;
+use crate::core::osc::{OscTokenizer, percent_decode};
 use crate::daemon::protocol::{
     AuthResponse, DaemonMsg, MAX_FRAME, NativeSshSpec, PaneInfo, RemoteContext, RemoteKind,
     ShellSpec, WinSize,
@@ -736,6 +736,7 @@ struct PaneState {
     shell_spec: Option<ShellSpec>,
     remote: Option<RemoteContext>,
     agent: Option<crate::core::cli_agent::CLIAgent>,
+    foreground_app: Option<crate::core::foreground_app::ForegroundApp>,
     agent_argv: Option<Vec<String>>,
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
     command_input: CommandInput,
@@ -871,6 +872,7 @@ enum PaneBackend {
 struct ForegroundProbes {
     remote: Box<dyn Fn() -> Option<RemoteContext> + Send>,
     agent: Box<dyn Fn() -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> + Send>,
+    app: Box<dyn Fn() -> Option<Option<crate::core::foreground_app::ForegroundApp>> + Send>,
     cwd: Box<dyn Fn() -> Option<PathBuf> + Send>,
 }
 
@@ -1089,6 +1091,7 @@ pub struct Carried {
     pub last_exit: Option<i32>,
     pub remote: Option<RemoteContext>,
     pub agent: Option<crate::core::cli_agent::CLIAgent>,
+    pub foreground_app: Option<crate::core::foreground_app::ForegroundApp>,
     pub agent_argv: Option<Vec<String>>,
     pub agent_session: Option<crate::core::cli_agent::AgentSessionState>,
     pub ended_agent: Option<(crate::core::cli_agent::CLIAgent, Option<Vec<String>>)>,
@@ -1464,6 +1467,7 @@ impl DaemonPane {
                 shell_spec: spawn.shell.clone(),
                 remote: spawn.remote.clone(),
                 agent: None,
+                foreground_app: None,
                 agent_session: None,
                 agent_argv: None,
                 ended_agent: None,
@@ -1560,6 +1564,7 @@ impl DaemonPane {
         let fg_master = master.clone();
         let remote_master = master.clone();
         let agent_master = master.clone();
+        let app_master = master.clone();
         let process_agent_seen = Mutex::new(None);
         let agent_state = state.clone();
         let cwd_master = master.clone();
@@ -1577,6 +1582,7 @@ impl DaemonPane {
                 agent: Box::new(move || {
                     foreground_agent(&agent_master, shell_pid, &process_agent_seen, &agent_state)
                 }),
+                app: Box::new(move || foreground_app(&app_master, shell_pid)),
                 cwd: Box::new(move || foreground_cwd(&cwd_master, shell_pid)),
             },
             death,
@@ -1624,6 +1630,7 @@ impl DaemonPane {
             last_exit: st.shell.last_exit_code,
             remote: st.remote.clone(),
             agent: st.agent,
+            foreground_app: st.foreground_app,
             agent_argv: st.agent_argv.clone(),
             agent_session: st.agent_session.clone(),
             ended_agent: st.ended_agent.clone(),
@@ -1692,6 +1699,7 @@ impl DaemonPane {
                 },
                 remote: carried.remote,
                 agent: carried.agent,
+                foreground_app: carried.foreground_app,
                 agent_session: carried.agent_session,
                 agent_argv: carried.agent_argv,
                 ended_agent: carried.ended_agent,
@@ -1743,6 +1751,7 @@ impl DaemonPane {
             shell: ShellState::default(),
             remote: Some(remote),
             agent: None,
+            foreground_app: None,
             agent_session: None,
             agent_argv: None,
             ended_agent: None,
@@ -1790,6 +1799,7 @@ impl DaemonPane {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             death,
@@ -1839,6 +1849,7 @@ impl DaemonPane {
         let ForegroundProbes {
             remote: foreground_remote,
             agent: foreground_agent_fn,
+            app: foreground_app_fn,
             cwd: foreground_cwd_fn,
         } = probes;
         std::thread::Builder::new()
@@ -2011,6 +2022,7 @@ impl DaemonPane {
                                 None
                             };
                             let agent = poll_now.then(&foreground_agent_fn).flatten();
+                            let app = poll_now.then(&foreground_app_fn).flatten();
                             let probed_cwd = poll_now.then(&foreground_cwd_fn).flatten();
 
                             let tr1 = trace.then(std::time::Instant::now);
@@ -2030,6 +2042,9 @@ impl DaemonPane {
                             // the hook and shell lifecycle must have the last word.
                             if let Some(agent) = agent {
                                 apply_agent(&mut st, agent);
+                            }
+                            if let Some(app) = app {
+                                apply_foreground_app(&mut st, app);
                             }
                             let (agent_ended, command_started) = apply_signals(&mut st, signals);
                             if let Some(remote) = remote {
@@ -2657,6 +2672,9 @@ fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
     if st.agent.is_some() {
         let _ = subscriber.send(DaemonMsg::Agent(st.agent));
     }
+    if st.foreground_app.is_some() {
+        let _ = subscriber.send(DaemonMsg::ForegroundApp(st.foreground_app));
+    }
     if st.agent_session.is_some() {
         let _ = subscriber.send(DaemonMsg::AgentStatus(st.agent_session.clone()));
     }
@@ -2964,6 +2982,17 @@ fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
     st.cwd = None;
     notify(st, DaemonMsg::RemoteContext(remote.clone()));
     st.remote = remote;
+}
+
+fn apply_foreground_app(
+    st: &mut PaneState,
+    app: Option<crate::core::foreground_app::ForegroundApp>,
+) {
+    if st.foreground_app != app {
+        st.foreground_app = app;
+        crate::core::machine::observe_pane(st.id, |record| record.foreground_app = app);
+        notify(st, DaemonMsg::ForegroundApp(app));
+    }
 }
 
 fn apply_agent(
@@ -3336,6 +3365,40 @@ fn foreground_agent(
     None
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn foreground_app(
+    master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    _shell_pid: Option<u32>,
+) -> Option<Option<crate::core::foreground_app::ForegroundApp>> {
+    let pid = master
+        .lock()
+        .ok()?
+        .as_ref()
+        .and_then(|m| m.process_group_leader())?;
+    Some(
+        crate::daemon::procinfo::proc_name(pid)
+            .as_deref()
+            .and_then(crate::core::foreground_app::ForegroundApp::from_process_name),
+    )
+}
+
+#[cfg(windows)]
+fn foreground_app(
+    _master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    shell_pid: Option<u32>,
+) -> Option<Option<crate::core::foreground_app::ForegroundApp>> {
+    let procs = crate::daemon::winproc::snapshot();
+    Some(crate::daemon::winproc::foreground_app(&procs, shell_pid?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn foreground_app(
+    _master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
+    _shell_pid: Option<u32>,
+) -> Option<Option<crate::core::foreground_app::ForegroundApp>> {
+    None
+}
+
 #[cfg(windows)]
 fn windows_agent_probe_signal(
     process_agent: &mut Option<crate::core::cli_agent::CLIAgent>,
@@ -3568,32 +3631,6 @@ pub(crate) fn parse_osc_title(payload: &[u8]) -> Option<String> {
         true => title.chars().take(MAX_OSC_TITLE).collect(),
         false => title.to_string(),
     })
-}
-
-fn percent_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            if let (Some(h), Some(l)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(input[i]);
-        i += 1;
-    }
-    out
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -5400,19 +5437,6 @@ mod tests {
     }
 
     #[test]
-    fn hex_val_ranges() {
-        assert_eq!(hex_val(b'0'), Some(0));
-        assert_eq!(hex_val(b'9'), Some(9));
-        assert_eq!(hex_val(b'a'), Some(10));
-        assert_eq!(hex_val(b'f'), Some(15));
-        assert_eq!(hex_val(b'A'), Some(10));
-        assert_eq!(hex_val(b'F'), Some(15));
-        assert!(hex_val(b'g').is_none());
-        assert!(hex_val(b' ').is_none());
-        assert!(hex_val(b'/').is_none());
-    }
-
-    #[test]
     fn osc133_exit_code_parsing() {
         let mut s = OscSniffer::new();
         let d = s.feed(b"\x1b]133;D\x07");
@@ -5446,6 +5470,7 @@ mod tests {
             shell: ShellState::default(),
             remote: None,
             agent: None,
+            foreground_app: None,
             agent_session: None,
             agent_argv: None,
             ended_agent: None,
@@ -5672,6 +5697,7 @@ mod tests {
                 ForegroundProbes {
                     remote: Box::new(|| None),
                     agent: Box::new(move || Some(detected.clone())),
+                    app: Box::new(|| None),
                     cwd: Box::new(|| None),
                 },
                 Arc::new(DeathReporter::new(|| {})),
@@ -5861,6 +5887,7 @@ mod tests {
                     ForegroundProbes {
                         remote: Box::new(|| None),
                         agent: Box::new(move || Some(Some((agent, argv.clone())))),
+                        app: Box::new(|| None),
                         cwd: Box::new(|| None),
                     },
                     Arc::new(DeathReporter::new(|| {})),
@@ -5935,6 +5962,7 @@ mod tests {
                 ForegroundProbes {
                     remote: Box::new(|| None),
                     agent: Box::new(|| Some(None)),
+                    app: Box::new(|| None),
                     cwd: Box::new(|| None),
                 },
                 Arc::new(DeathReporter::new(|| {})),
@@ -5996,6 +6024,7 @@ mod tests {
                 ForegroundProbes {
                     remote: Box::new(|| None),
                     agent: Box::new(|| Some(None)),
+                    app: Box::new(|| None),
                     cwd: Box::new(|| None),
                 },
                 Arc::new(DeathReporter::new(|| {})),
@@ -6255,6 +6284,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(move || Some(Some((CLIAgent::Claude, argv.clone())))),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(|| {})),
@@ -6308,6 +6338,7 @@ mod tests {
                     ForegroundProbes {
                         remote: Box::new(|| None),
                         agent: Box::new(|| Some(None)),
+                        app: Box::new(|| None),
                         cwd: Box::new(|| None),
                     },
                     Arc::new(DeathReporter::new(|| {})),
@@ -6493,6 +6524,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| Some(None)),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(|| {})),
@@ -6753,6 +6785,42 @@ mod tests {
             matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p.as_path() == std::path::Path::new("/work"))
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn foreground_app_reports_changes_and_replays_on_attach() {
+        use crate::core::foreground_app::ForegroundApp;
+
+        let mut st = test_state(true);
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber(&mut st, tx);
+        rx.try_iter().for_each(drop);
+
+        apply_foreground_app(&mut st, Some(ForegroundApp::Herdr));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonMsg::ForegroundApp(Some(ForegroundApp::Herdr)))
+        ));
+        apply_foreground_app(&mut st, Some(ForegroundApp::Herdr));
+        assert!(rx.try_recv().is_err());
+
+        let (reconnect, replay) = mpsc::channel();
+        attach_subscriber(&mut st, reconnect);
+        assert!(
+            replay
+                .try_iter()
+                .any(|message| message == DaemonMsg::ForegroundApp(Some(ForegroundApp::Herdr)))
+        );
+
+        apply_foreground_app(&mut st, None);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            replay.try_recv(),
+            Ok(DaemonMsg::ForegroundApp(None))
+        ));
     }
 
     #[test]
@@ -7075,6 +7143,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(move || {
@@ -7179,6 +7248,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(|| {})),
@@ -7276,6 +7346,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             death.clone(),
@@ -7313,6 +7384,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             death.clone(),
@@ -7383,6 +7455,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(|| {})),
@@ -7429,6 +7502,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(|| {})),
@@ -7480,6 +7554,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| Some(PathBuf::from("/Users/alice/dev/tty7"))),
             },
             Arc::new(DeathReporter::new(|| {})),
@@ -7511,6 +7586,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(move || dead_tx.send(()).unwrap())),
@@ -7537,6 +7613,7 @@ mod tests {
             ForegroundProbes {
                 remote: Box::new(|| None),
                 agent: Box::new(|| None),
+                app: Box::new(|| None),
                 cwd: Box::new(|| None),
             },
             Arc::new(DeathReporter::new(move || {

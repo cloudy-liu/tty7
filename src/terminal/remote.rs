@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 
 use crate::core::cli_agent::{AgentSessionState, CLIAgent};
 use crate::core::config::CursorStyle as ConfigCursorStyle;
+use crate::core::foreground_app::ForegroundApp;
 use crate::core::osc::OscTokenizer;
 use crate::daemon::protocol::{
     AuthPromptKind, AuthResponse, ClientMsg, DaemonMsg, KnownHostEntry, KnownHostId,
@@ -68,6 +69,7 @@ struct ReaderSignals {
     shell: Arc<Mutex<ShellState>>,
     remote: Arc<Mutex<Option<RemoteContext>>>,
     agent: Arc<Mutex<Option<CLIAgent>>>,
+    foreground_app: Arc<Mutex<Option<ForegroundApp>>>,
     agent_session: Arc<Mutex<Option<AgentSessionState>>>,
     exited: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
@@ -499,6 +501,7 @@ pub struct RemoteTerminal {
     ssh_user: Option<String>,
     auto_supplied_password: bool,
     agent: Arc<Mutex<Option<CLIAgent>>>,
+    foreground_app: Arc<Mutex<Option<ForegroundApp>>>,
     agent_session: Arc<Mutex<Option<AgentSessionState>>>,
     /// Kitty-graphics images placed on this pane's grid (issue #213).
     /// Written by the reader thread from out-of-band `Image`/`DeleteImage`
@@ -778,6 +781,9 @@ impl RemoteTerminal {
     ) -> anyhow::Result<()> {
         self.stop_reader();
         while self.events.try_recv().is_ok() {}
+        if let Ok(mut app) = self.foreground_app.lock() {
+            *app = None;
+        }
 
         let read_half = stream.try_clone()?;
 
@@ -809,6 +815,7 @@ impl RemoteTerminal {
                 shell: self.shell_state.clone(),
                 remote: self.remote_context.clone(),
                 agent: self.agent.clone(),
+                foreground_app: self.foreground_app.clone(),
                 agent_session: self.agent_session.clone(),
                 exited: self.exited_flag.clone(),
                 child_exited: self.child_exited.clone(),
@@ -861,6 +868,7 @@ impl RemoteTerminal {
         let shell_state: Arc<Mutex<ShellState>> = Arc::new(Mutex::new(ShellState::default()));
         let remote_context: Arc<Mutex<Option<RemoteContext>>> = Arc::new(Mutex::new(None));
         let agent: Arc<Mutex<Option<CLIAgent>>> = Arc::new(Mutex::new(None));
+        let foreground_app: Arc<Mutex<Option<ForegroundApp>>> = Arc::new(Mutex::new(None));
         let agent_session: Arc<Mutex<Option<AgentSessionState>>> = Arc::new(Mutex::new(None));
         let exited_flag = Arc::new(AtomicBool::new(false));
         let child_exited = Arc::new(AtomicBool::new(false));
@@ -886,6 +894,7 @@ impl RemoteTerminal {
                 shell: shell_state.clone(),
                 remote: remote_context.clone(),
                 agent: agent.clone(),
+                foreground_app: foreground_app.clone(),
                 agent_session: agent_session.clone(),
                 exited: exited_flag.clone(),
                 child_exited: child_exited.clone(),
@@ -928,6 +937,7 @@ impl RemoteTerminal {
             ssh_user: None,
             auto_supplied_password: false,
             agent,
+            foreground_app,
             agent_session,
             images,
             turns,
@@ -994,6 +1004,7 @@ impl RemoteTerminal {
                     shell,
                     remote,
                     agent,
+                    foreground_app,
                     agent_session,
                     exited: exited_flag,
                     child_exited,
@@ -1394,6 +1405,13 @@ impl RemoteTerminal {
                                     proxy.send_event(AlacEvent::Wakeup);
                                 }
                             }
+                            DaemonMsg::ForegroundApp(app) => {
+                                flush_batch!();
+                                if let Ok(mut guard) = foreground_app.lock() {
+                                    *guard = app;
+                                    proxy.send_event(AlacEvent::Wakeup);
+                                }
+                            }
                             DaemonMsg::AgentStatus(mut state) => {
                                 flush_batch!();
                                 let detected_agent = agent.lock().ok().and_then(|g| *g);
@@ -1609,6 +1627,10 @@ impl RemoteTerminal {
 
     pub fn foreground_agent(&self) -> Option<CLIAgent> {
         self.agent.lock().ok().and_then(|g| *g)
+    }
+
+    pub fn foreground_app(&self) -> Option<ForegroundApp> {
+        self.foreground_app.lock().ok().and_then(|g| *g)
     }
 
     /// The kitty-graphics image store for this pane. Cheap handle clone — the
@@ -4843,6 +4865,35 @@ mod tests {
         DaemonMsg::Agent(None).encode(&mut daemon_side).unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(None), "agent exit should clear it");
+    }
+
+    #[test]
+    fn foreground_app_follows_daemon_reports() {
+        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        assert_eq!(term.foreground_app(), None);
+
+        let poll = |want: Option<ForegroundApp>| {
+            for _ in 0..200 {
+                if term.foreground_app() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        DaemonMsg::ForegroundApp(Some(ForegroundApp::Herdr))
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(Some(ForegroundApp::Herdr)));
+
+        DaemonMsg::ForegroundApp(None)
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        assert!(poll(None));
     }
 
     #[test]

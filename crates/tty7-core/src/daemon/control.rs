@@ -258,6 +258,11 @@ pub enum ControlRequest {
         tab: TabId,
         name: Option<String>,
     },
+    TabFocusPane {
+        workspace: WorkspaceId,
+        tab: TabId,
+        pane: u64,
+    },
     TabMove {
         workspace: WorkspaceId,
         tab: TabId,
@@ -363,6 +368,7 @@ impl ControlRequest {
             | TabCreate { .. }
             | TabClose { .. }
             | TabRename { .. }
+            | TabFocusPane { .. }
             | TabMove { .. }
             | TabSetGroup { .. }
             | PaneSplit { .. }
