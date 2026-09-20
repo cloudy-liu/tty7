@@ -196,14 +196,16 @@ Download the newest fork-maintained build from
 Release assets also include `checksums.txt` and the headless `tty7-server`
 binaries used by remote workspaces.
 
-`v26.8.3-c.8` builds on c.7 and includes full workspace recovery after daemon
-replacement from [cloudy-liu/tty7#35](https://github.com/cloudy-liu/tty7/pull/35).
-With session restoration enabled, all formerly open projects return. A
-surviving daemon retains the single-window startup behavior. See the
-[c.8 release record](docs/releases/v26.8.3-c.8.md) for the commit ledger.
+`v26.8.3-c.9` builds on c.8 and shows Herdr's colored avatar when its tty7
+pane is focused, including shells that do not report command text. Codex or
+Claude Code inside Herdr leaves that avatar in place; a separate tty7 split
+shows its own agent icon when focused. The sidebar, top tab strip, and workspace
+switcher follow the same pane, using its last focus in the background. The
+selected pane's agent status dot remains visible. See the
+[c.9 release record](docs/releases/v26.8.3-c.9.md) for the commit ledger.
 Release assets become available after the draft's builds and checksums are verified.
 The broader `v26.9.1-c` release has been withdrawn. If you installed it,
-download and install c.8 manually; the updater does not downgrade.
+download and install c.9 manually; the updater does not downgrade.
 
 ## Versioning
 
