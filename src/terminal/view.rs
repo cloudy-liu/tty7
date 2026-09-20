@@ -1554,6 +1554,14 @@ impl TerminalView {
         self.terminal.foreground_agent()
     }
 
+    pub(crate) fn foreground_app(&self) -> Option<crate::core::foreground_app::ForegroundApp> {
+        self.terminal.foreground_app().or_else(|| {
+            crate::core::foreground_app::ForegroundApp::from_command_mark(
+                &self.terminal.running_command(),
+            )
+        })
+    }
+
     pub fn agent_session(&self) -> Option<crate::core::cli_agent::AgentSessionState> {
         self.terminal.agent_session()
     }

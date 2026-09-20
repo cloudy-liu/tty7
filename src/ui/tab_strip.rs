@@ -34,6 +34,26 @@ pub(crate) const GRAB_HANDLE_W: f32 = 80.;
 
 const KEEP_SEGMENTS: usize = 3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabAvatar {
+    Agent(crate::core::cli_agent::CLIAgent),
+    App(crate::core::foreground_app::ForegroundApp),
+    Terminal,
+}
+
+impl TabAvatar {
+    pub(crate) fn choose(
+        agent: Option<crate::core::cli_agent::CLIAgent>,
+        app: Option<crate::core::foreground_app::ForegroundApp>,
+    ) -> Self {
+        match (agent, app) {
+            (Some(agent), _) => Self::Agent(agent),
+            (None, Some(app)) => Self::App(app),
+            (None, None) => Self::Terminal,
+        }
+    }
+}
+
 /// Builds a launch specification without recomputing argument ownership locally.
 /// The inventory may originate from a remote host, so only its transported
 /// metadata can distinguish tty7 launch defaults from user-authored arguments.
@@ -1157,7 +1177,7 @@ impl Tty7App {
     pub(crate) fn tab_avatar(
         &self,
         id: impl Into<gpui::ElementId>,
-        agent: Option<crate::core::cli_agent::CLIAgent>,
+        avatar: TabAvatar,
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: usize,
         ssh: Option<u32>,
@@ -1171,8 +1191,8 @@ impl Tty7App {
             .flex()
             .items_center()
             .justify_center();
-        match agent {
-            Some(agent) => {
+        match avatar {
+            TabAvatar::Agent(agent) => {
                 let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
                 let dot = status
                     .and_then(|s| s.dot_rgb())
@@ -1198,7 +1218,13 @@ impl Tty7App {
                     })
                     .into_any_element()
             }
-            None => base
+            TabAvatar::App(crate::core::foreground_app::ForegroundApp::Herdr) => base
+                .child(gpui::svg().path("icons/herdr.svg").size(px(size * 0.78)))
+                .tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new("Herdr").build(window, cx)
+                })
+                .into_any_element(),
+            TabAvatar::Terminal => base
                 .relative()
                 .rounded_full()
                 .bg(cx.theme().muted)
@@ -1605,6 +1631,7 @@ impl Tty7App {
             let ssh_dot = self.tab_ssh_dot(tab, cx);
             let agent_badge = tab.focused_agent_badge(window, cx);
             let agent = agent_badge.agent;
+            let avatar = TabAvatar::choose(agent, tab.foreground_app(Some(window), cx));
             let agent_status = agent_badge.status;
             let agent_unread = agent_badge.unread;
 
@@ -1723,10 +1750,10 @@ impl Tty7App {
                             .bg(gpui::rgb(rgb)),
                     )
                 })
-                .when_some(agent, |chip, agent| {
+                .when(avatar != TabAvatar::Terminal, |chip| {
                     chip.child(self.tab_avatar(
                         ("tab-avatar", i),
-                        Some(agent),
+                        avatar,
                         agent_status,
                         agent_unread,
                         None,
@@ -1922,6 +1949,21 @@ mod tests {
         p.user = user.to_string();
         p.host = addr.to_string();
         p
+    }
+
+    #[test]
+    fn avatar_identity_prefers_an_agent_over_the_host_app() {
+        use crate::core::cli_agent::CLIAgent;
+        use crate::core::foreground_app::ForegroundApp;
+
+        assert_eq!(
+            super::TabAvatar::choose(Some(CLIAgent::Codex), Some(ForegroundApp::Herdr)),
+            super::TabAvatar::Agent(CLIAgent::Codex)
+        );
+        assert_eq!(
+            super::TabAvatar::choose(None, Some(ForegroundApp::Herdr)),
+            super::TabAvatar::App(ForegroundApp::Herdr)
+        );
     }
 
     #[test]

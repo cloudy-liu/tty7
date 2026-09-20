@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 pub const FEATURE_PANE_OWNER: &str = "pane-owner";
 
@@ -860,6 +860,7 @@ pub enum DaemonMsg {
     },
     RemoteContext(Option<RemoteContext>),
     Agent(Option<crate::core::cli_agent::CLIAgent>),
+    ForegroundApp(Option<crate::core::foreground_app::ForegroundApp>),
     AgentStatus(Option<crate::core::cli_agent::AgentSessionState>),
     LoopbackForward(LoopbackForward),
     AuthPrompt {
@@ -938,6 +939,7 @@ mod kind {
     pub const FORWARD_LIST: u8 = 20;
     pub const AGENT: u8 = 21;
     pub const AGENT_STATUS: u8 = 22;
+    pub const FOREGROUND_APP: u8 = 23;
     pub const VERSION_REPLY: u8 = 40;
     pub const PROCS: u8 = 50;
     pub const INPUT_ACK: u8 = 51;
@@ -1311,6 +1313,7 @@ impl DaemonMsg {
                 write_frame(w, kind::REMOTE_CONTEXT, &to_json(remote)?)
             }
             DaemonMsg::Agent(agent) => write_frame(w, kind::AGENT, &to_json(agent)?),
+            DaemonMsg::ForegroundApp(app) => write_frame(w, kind::FOREGROUND_APP, &to_json(app)?),
             DaemonMsg::AgentStatus(state) => write_frame(w, kind::AGENT_STATUS, &to_json(state)?),
             DaemonMsg::LoopbackForward(forward) => {
                 write_frame(w, kind::LOOPBACK_FORWARD, &to_json(forward)?)
@@ -1372,6 +1375,7 @@ impl DaemonMsg {
             },
             kind::REMOTE_CONTEXT => DaemonMsg::RemoteContext(from_json(&payload)?),
             kind::AGENT => DaemonMsg::Agent(from_json(&payload)?),
+            kind::FOREGROUND_APP => DaemonMsg::ForegroundApp(from_json(&payload)?),
             kind::AGENT_STATUS => DaemonMsg::AgentStatus(from_json(&payload)?),
             kind::LOOPBACK_FORWARD => DaemonMsg::LoopbackForward(from_json(&payload)?),
             kind::AUTH_PROMPT => {
@@ -1711,6 +1715,8 @@ mod tests {
             DaemonMsg::Agent(Some(crate::core::cli_agent::CLIAgent::Claude)),
             DaemonMsg::Agent(Some(crate::core::cli_agent::CLIAgent::Codex)),
             DaemonMsg::Agent(None),
+            DaemonMsg::ForegroundApp(Some(crate::core::foreground_app::ForegroundApp::Herdr)),
+            DaemonMsg::ForegroundApp(None),
             DaemonMsg::AgentStatus(Some(crate::core::cli_agent::AgentSessionState {
                 status: crate::core::cli_agent::AgentStatus::Waiting,
                 message: Some("Claude needs your permission to use Bash".into()),

@@ -50,6 +50,37 @@ pub(crate) fn foreground_name(procs: &[Proc], shell_pid: u32) -> Option<String> 
         .map(|(_, _, name)| name.to_string())
 }
 
+/// A foreground program may own children (Herdr owns terminal processes), so
+/// inspect the selected process's ancestry rather than only its leaf name.
+pub(crate) fn foreground_app(
+    procs: &[Proc],
+    shell_pid: u32,
+) -> Option<crate::core::foreground_app::ForegroundApp> {
+    if let Some(app) = procs
+        .iter()
+        .find(|p| p.pid == shell_pid)
+        .and_then(|p| crate::core::foreground_app::ForegroundApp::from_process_name(&p.name))
+    {
+        return Some(app);
+    }
+    let mut pid = walk(procs, shell_pid)
+        .into_iter()
+        .max_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)))?
+        .1;
+    loop {
+        let process = procs.iter().find(|p| p.pid == pid)?;
+        if let Some(app) =
+            crate::core::foreground_app::ForegroundApp::from_process_name(&process.name)
+        {
+            return Some(app);
+        }
+        if process.parent == shell_pid {
+            return None;
+        }
+        pid = process.parent;
+    }
+}
+
 const AGENT_SCAN_MAX_DEPTH: u32 = 3;
 
 fn detect_foreground_agent_with<F>(
@@ -793,6 +824,25 @@ mod tests {
     fn foreground_name_is_none_at_idle_prompt() {
         let procs = vec![p(100, 1, "powershell.exe"), p(999, 1, "explorer.exe")];
         assert_eq!(foreground_name(&procs, 100), None);
+    }
+
+    #[test]
+    fn herdr_remains_the_foreground_app_when_it_owns_nested_processes() {
+        use crate::core::foreground_app::ForegroundApp;
+
+        let procs = vec![
+            p(100, 1, "cmd.exe"),
+            p(200, 100, "herdr.exe"),
+            p(300, 200, "powershell.exe"),
+            p(400, 300, "codex.exe"),
+        ];
+        assert_eq!(foreground_app(&procs, 100), Some(ForegroundApp::Herdr));
+        assert_eq!(foreground_app(&procs, 300), None);
+        assert_eq!(foreground_app(&[p(100, 1, "cmd.exe")], 100), None);
+        assert_eq!(
+            foreground_app(&[p(100, 1, "herdr.exe")], 100),
+            Some(ForegroundApp::Herdr)
+        );
     }
 
     #[test]

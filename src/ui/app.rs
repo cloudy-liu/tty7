@@ -555,6 +555,15 @@ impl Tab {
         leaf.and_then(|l| l.terminal().cloned())
     }
 
+    pub(crate) fn foreground_app(
+        &self,
+        window: Option<&Window>,
+        cx: &App,
+    ) -> Option<crate::core::foreground_app::ForegroundApp> {
+        self.title_leaf(window, cx)
+            .and_then(|leaf| leaf.read(cx).foreground_app())
+    }
+
     pub(crate) fn leaf_title(&self, window: Option<&Window>, cx: &App) -> String {
         self.title_leaf(window, cx)
             .map(|l| l.read(cx).title.clone())

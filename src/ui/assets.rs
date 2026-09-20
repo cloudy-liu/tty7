@@ -47,6 +47,7 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/machine-local.svg" => include_bytes!("../../assets/icons/machine-local.svg"),
         "icons/machine-remote.svg" => include_bytes!("../../assets/icons/machine-remote.svg"),
         "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
+        "icons/herdr.svg" => include_bytes!("../../assets/icons/herdr.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
         "icons/agents/gemini.svg" => include_bytes!("../../assets/icons/agents/gemini.svg"),
@@ -101,6 +102,11 @@ mod tests {
                 agent.display_name()
             );
         }
+    }
+
+    #[test]
+    fn herdr_icon_resolves() {
+        assert!(Assets.load("icons/herdr.svg").unwrap().is_some());
     }
 
     #[test]

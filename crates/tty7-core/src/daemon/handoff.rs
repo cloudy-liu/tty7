@@ -92,6 +92,8 @@ struct PaneRecord {
     last_exit: Option<i32>,
     remote: Option<crate::daemon::protocol::RemoteContext>,
     agent: Option<crate::core::cli_agent::CLIAgent>,
+    #[serde(default)]
+    foreground_app: Option<crate::core::foreground_app::ForegroundApp>,
     agent_argv: Option<Vec<String>>,
     agent_session: Option<crate::core::cli_agent::AgentSessionState>,
     #[serde(default)]
@@ -242,6 +244,7 @@ fn stage(panes: &[Carried], next_pane_id: u64) -> std::io::Result<std::fs::File>
             last_exit: pane.last_exit,
             remote: pane.remote.clone(),
             agent: pane.agent,
+            foreground_app: pane.foreground_app,
             agent_argv: pane.agent_argv.clone(),
             agent_session: pane.agent_session.clone(),
             ended_agent: pane.ended_agent.clone(),
@@ -377,6 +380,7 @@ pub fn adopt(fd: RawFd) -> Option<Adopted> {
             last_exit: record.last_exit,
             remote: record.remote,
             agent: record.agent,
+            foreground_app: record.foreground_app,
             agent_argv: record.agent_argv,
             agent_session: record.agent_session,
             ended_agent: record.ended_agent,
@@ -422,6 +426,7 @@ mod tests {
             last_exit: Some(0),
             remote: None,
             agent: None,
+            foreground_app: None,
             agent_argv: None,
             agent_session: None,
             ended_agent: None,
