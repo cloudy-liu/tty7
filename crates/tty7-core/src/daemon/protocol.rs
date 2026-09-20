@@ -2488,7 +2488,7 @@ mod tests {
     #[test]
     fn the_local_daemon_does_not_claim_the_control_dialect() {
         let v = DaemonVersion::current();
-        assert_eq!(v.protocol, 5);
+        assert_eq!(v.protocol, 6);
         assert!(
             !v.has_feature(crate::daemon::control::feature::CONTROL),
             "the session daemon must not advertise a dialect it cannot serve"
