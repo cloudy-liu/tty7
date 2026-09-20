@@ -73,6 +73,7 @@ Changes available only in source builds from `main` are marked **unreleased**.
 | Agent badges follow the focused pane | All | [Closed upstream](https://github.com/l0ng-ai/tty7/pull/719) |
 | Reliable coding-agent identity across restart, failed resume, and exit **(c.6)** | All | Not submitted |
 | Exact agent-session restore after server restarts, with shell fallback **(c.7)** | All | Not submitted |
+| Restore every open workspace after daemon replacement **(c.8)** | All | Not submitted |
 | Transparent, theme-aware avatars for all 19 agents **(c.6)** | All | Not submitted |
 | Antigravity brand icon support | All | Not submitted |
 | Bell off by default | All | Fork default |
@@ -150,6 +151,13 @@ is no longer a difference.
   opening a session picker. Cursor and Antigravity still need an exact id
   already known to tty7. See [agent sessions](docs/agents/sessions.mdx) and
   [cloudy-liu/tty7#29](https://github.com/cloudy-liu/tty7/pull/29).
+- When the background daemon has been replaced, reopens every workspace that
+  had a window before shutdown instead of recovering only the last-focused
+  project. The foreground workspace opens first; the others return as visible,
+  unfocused windows with their saved geometry. Each pane follows the existing
+  attach-first path, then resumes its saved agent session when attachment is
+  unavailable. A surviving daemon keeps the lighter single-window behavior.
+  See [cloudy-liu/tty7#35](https://github.com/cloudy-liu/tty7/pull/35).
 - Draws all 19 supported agent marks, including Antigravity, without colored
   circular backgrounds and increases the glyph from 54% to 78% of the avatar.
   Codex, Cursor, and Grok follow the theme foreground; the other agents retain
@@ -188,14 +196,14 @@ Download the newest fork-maintained build from
 Release assets also include `checksums.txt` and the headless `tty7-server`
 binaries used by remote workspaces.
 
-`v26.8.3-c.7` builds on c.6 and includes the agent-session restore fixes from
-[cloudy-liu/tty7#29](https://github.com/cloudy-liu/tty7/pull/29). Exact session
-identity survives server restarts, untouched launches reopen directly, and an
-unknown conversation leaves a shell.
-See the [c.7 release record](docs/releases/v26.8.3-c.7.md) for the commit ledger.
+`v26.8.3-c.8` builds on c.7 and includes full workspace recovery after daemon
+replacement from [cloudy-liu/tty7#35](https://github.com/cloudy-liu/tty7/pull/35).
+With session restoration enabled, all formerly open projects return. A
+surviving daemon retains the single-window startup behavior. See the
+[c.8 release record](docs/releases/v26.8.3-c.8.md) for the commit ledger.
 Release assets become available after the draft's builds and checksums are verified.
 The broader `v26.9.1-c` release has been withdrawn. If you installed it,
-download and install c.7 manually; the updater does not downgrade.
+download and install c.8 manually; the updater does not downgrade.
 
 ## Versioning
 
