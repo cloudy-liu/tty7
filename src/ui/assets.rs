@@ -48,6 +48,11 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/machine-remote.svg" => include_bytes!("../../assets/icons/machine-remote.svg"),
         "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
         "icons/herdr.svg" => include_bytes!("../../assets/icons/herdr.svg"),
+        "icons/status/blocked.svg" => include_bytes!("../../assets/icons/status/blocked.svg"),
+        "icons/status/working.svg" => include_bytes!("../../assets/icons/status/working.svg"),
+        "icons/status/done.svg" => include_bytes!("../../assets/icons/status/done.svg"),
+        "icons/status/idle.svg" => include_bytes!("../../assets/icons/status/idle.svg"),
+        "icons/status/unknown.svg" => include_bytes!("../../assets/icons/status/unknown.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
         "icons/agents/gemini.svg" => include_bytes!("../../assets/icons/agents/gemini.svg"),
@@ -100,6 +105,17 @@ mod tests {
                 Assets.load(path).unwrap().is_some(),
                 "{} points at {path}, which nothing serves",
                 agent.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn every_status_indicator_resolves() {
+        for indicator in crate::ui::status_indicator::StatusIndicator::ALL {
+            let path = indicator.icon_path();
+            assert!(
+                Assets.load(path).unwrap().is_some(),
+                "{indicator:?} points at {path}, which nothing serves"
             );
         }
     }

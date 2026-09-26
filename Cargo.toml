@@ -86,6 +86,10 @@ keyring = "4"
 # is already in the tree transitively, so it pins no new code; plist is pure Rust.
 serde_yaml = "0.9"
 plist = "1"
+# herdr's agent screen-detection manifests (`assets/agent-detection/*.toml`,
+# read by `terminal::screen_status`). Already in the tree transitively, so it
+# pins no new code.
+toml = "0.8"
 
 # Clipboard-image paste (`terminal::view`). When the clipboard holds a screenshot
 # and a coding-agent TUI (Claude Code &co.) is in the pane, off macOS we stage the

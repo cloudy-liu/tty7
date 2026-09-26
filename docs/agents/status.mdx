@@ -1,11 +1,12 @@
 ---
 title: "Status and notifications"
-description: "Installing the hooks, reading the dots, and being told when an agent needs you."
+description: "Installing the hooks, reading the status symbols, and being told when an agent needs you."
 ---
 
 An agent working for two minutes and an agent that stopped ninety seconds ago
-waiting for permission look identical from outside. tty7 fixes that by letting
-the agent say which one it is.
+waiting for permission look identical from outside. tty7 tells them apart two
+ways: the agent's hooks report what it is doing, and tty7 reads the agent's own
+screen the way [herdr](https://herdr.dev) does.
 
 ## Installing the hooks
 
@@ -15,7 +16,8 @@ the agent say which one it is.
 | Agent | |
 |---|---|
 | Claude Code · Codex · Copilot CLI · OpenCode · Pi · Grok Build · Oh My Pi · Gemini · Droid · Qwen Code · Goose · Kimi Code | Hooks available |
-| Aider · Amp · Cursor · Auggie · Hermes · Vibe · Antigravity | Detected and labelled, but no status channel yet |
+| Amp · Cursor · Hermes · Antigravity | No hooks; status comes from the screen |
+| Aider · Auggie · Vibe | Detected and labelled, but no status channel yet |
 
 Installing writes into that agent's own configuration directory. Once installed
 the row grows a second **Uninstall** button beside the first, which itself
@@ -33,23 +35,45 @@ to pick which one you are looking at, and the table then shows that machine's
 agents — so a dev box gets its hooks installed the same way, from the same
 screen.
 
-## The status dot
+## Reading the screen
 
-Every tab chip and sidebar row carries a dot:
+Hooks only report what an agent chooses to announce. Codex's hooks, for one,
+never mention a permission prompt, and Cursor and Antigravity have no hooks to
+install. So tty7 also reads the bottom of each agent's pane with
+[herdr's detection manifests](https://herdr.dev/docs/agents/): per-agent rules
+that recognise a spinner, an approval prompt or an idle input box.
 
-| Dot | Meaning |
+Claude Code, Codex, Gemini, Amp, OpenCode, Copilot CLI, Cursor, Droid, Pi,
+Hermes, Antigravity, Grok Build, Qwen Code and Kimi Code have manifests. When
+the screen shows clear evidence of a state, the screen wins; when it shows none,
+the hooks decide. The exception is Pi, Oh My Pi, Kimi Code and OpenCode, whose
+hooks cover the whole turn: once those report, they are trusted over the screen,
+as herdr trusts them.
+
+The screen is read by the window showing the pane. `tty7 agents` and
+[`tty7 wait`](/agents/orchestration) still go by the hooks alone.
+
+## The status symbol
+
+Every tab chip and sidebar row carries herdr's status symbol, in herdr's
+colours:
+
+| Symbol | Meaning |
 |---|---|
-| 🔵 **Blue** | Working |
-| 🟠 **Amber** | Needs your input — a permission prompt, a question |
-| 🟢 **Green** | Done with this turn |
+| **×** red | Blocked — a permission prompt, a question |
+| **◐** yellow | Working |
+| **✓** teal | Done with this turn, and you have not looked yet |
+| **○** green | Idle — waiting for your next prompt |
+| **·** grey | Status unknown — no hooks installed, nothing on screen to read |
 
-<Frame caption="Placeholder — screenshot: three sidebar rows, one working, one waiting, one done">
-  <img src="/images/placeholder.svg" alt="Agent status dots" />
+<Frame caption="Placeholder — screenshot: sidebar rows showing blocked, working, done and idle agents">
+  <img src="/images/placeholder.svg" alt="Agent status symbols" />
 </Frame>
 
-The same three states are what `tty7 agents` reports as `working` / `waiting` /
-`done`, and what [`tty7 wait`](/agents/orchestration) blocks on. A fourth state,
-`idle`, carries no dot — it is an agent that has not started a turn.
+A finished turn keeps its check until you look at the pane, then reads as idle.
+
+The hooks' three turn states are what `tty7 agents` reports as `working` /
+`waiting` / `done`, and what [`tty7 wait`](/agents/orchestration) blocks on.
 
 ## Notifications
 
@@ -67,7 +91,7 @@ tty7 keeps a status item in the system tray (menu bar on macOS). It flips to an
 attention state the moment *any* agent anywhere needs input, so you can see it
 without the window in front of you.
 
-Its menu lists every agent pane with its brand avatar and status dot — click one
+Its menu lists every agent pane with its brand avatar and status symbol — click one
 to reveal it — and also holds the notification policy switch and **Quit and Stop
 Server…**.
 

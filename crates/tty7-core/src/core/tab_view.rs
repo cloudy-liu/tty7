@@ -27,6 +27,8 @@ pub struct TabView {
     pub agent: Option<CLIAgent>,
     pub status: Option<AgentStatus>,
     /// Identity and status of the last focused pane, used for navigation.
+    /// `focused_status` is `None` for an agent whose status never reported,
+    /// which the GUI draws as unknown rather than idle.
     pub focused_agent: Option<CLIAgent>,
     pub focused_status: Option<AgentStatus>,
     pub foreground_app: Option<ForegroundApp>,
@@ -159,11 +161,7 @@ pub fn tab_views_of(ws: &Workspace, panes: &[PaneRecord]) -> Vec<TabView> {
                 agent: facts.map(|f| f.agent),
                 status: facts.and_then(|f| f.status),
                 focused_agent: focused.and_then(|p| p.agent.as_ref().map(|a| a.agent)),
-                focused_status: focused.and_then(|p| {
-                    p.agent
-                        .as_ref()
-                        .map(|a| a.status.unwrap_or(AgentStatus::Idle))
-                }),
+                focused_status: focused.and_then(|p| p.agent.as_ref()?.status),
                 foreground_app: focused.and_then(|p| p.foreground_app),
                 live: records.iter().any(|p| p.live),
                 panes: ids.len(),

@@ -9807,6 +9807,7 @@ dependencies = [
  "smallvec",
  "smol",
  "tempfile",
+ "toml 0.8.23",
  "tray-icon",
  "tty7-core",
  "unicode-segmentation",

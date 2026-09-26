@@ -329,6 +329,12 @@ pub struct TerminalView {
     agent_was_rich: bool,
     agent_result_unread: bool,
     keep_unread_on_focus: bool,
+    /// The agent's status as its screen shows it — see
+    /// [`crate::terminal::screen_status`].
+    screen_status: crate::terminal::screen_status::Tracker,
+    /// Bumped on every batch of output, so the screen is only read again once
+    /// something could have changed on it.
+    output_seq: u64,
     git_status_cwd: Option<std::path::PathBuf>,
     last_agent_activity: u64,
     cmd: CmdEditor,
@@ -1340,6 +1346,8 @@ impl TerminalView {
             agent_was_rich: false,
             agent_result_unread: false,
             keep_unread_on_focus: false,
+            screen_status: Default::default(),
+            output_seq: 0,
             git_status_cwd: None,
             last_agent_activity: 0,
             cmd: CmdEditor::new(),
@@ -1566,6 +1574,22 @@ impl TerminalView {
         self.terminal.agent_session()
     }
 
+    /// What the agent in this pane is doing: the hooks' report and the screen's
+    /// reading, reconciled the way herdr reconciles them. Everything that shows
+    /// a status reads it here rather than from [`Self::agent_session`], which
+    /// only knows what the hooks said.
+    pub fn agent_status(&self) -> Option<crate::core::cli_agent::AgentStatus> {
+        let session = self.terminal.agent_session();
+        match self.agent() {
+            Some(agent) => crate::terminal::screen_status::merge(
+                agent,
+                session.as_ref(),
+                self.screen_status.status(),
+            ),
+            None => session.map(|s| s.status),
+        }
+    }
+
     /// One entry per turn of the agent's conversation, oldest first — see
     /// [`crate::terminal::agent_marks`].
     pub fn agent_turns(&self) -> Vec<crate::terminal::agent_marks::AgentTurn> {
@@ -1620,9 +1644,10 @@ impl TerminalView {
         // turn still in flight — running, or stopped on a question — is work
         // that closing would cut short.
         if let Some(agent) = self.agent()
-            && self
-                .agent_session()
-                .is_some_and(|s| matches!(s.status, AgentStatus::Working | AgentStatus::Waiting))
+            && matches!(
+                self.agent_status(),
+                Some(AgentStatus::Working | AgentStatus::Waiting)
+            )
         {
             return Some(PaneBusy::Agent(agent.display_name()));
         }
@@ -1858,6 +1883,7 @@ impl TerminalView {
         }
         match ev {
             AlacEvent::Wakeup => {
+                self.output_seq = self.output_seq.wrapping_add(1);
                 // The grid moved under whatever the search bar last measured.
                 self.note_output_under_search(cx);
                 // Only a pane that is on screen repaints on output. The
@@ -3562,11 +3588,22 @@ impl TerminalView {
     ) -> bool {
         use crate::core::cli_agent::AgentStatus;
 
+        let agent = self.terminal.foreground_agent();
+        // The latest title, not the settled one the tab shows: a spinner in the
+        // title is exactly what settling holds back.
+        let title = self.pending_title.as_deref().unwrap_or(&self.title);
+        let term = &self.terminal.term;
+        self.screen_status
+            .observe(agent, self.output_seq, title, || {
+                crate::terminal::screen_status::detection_text(&term.lock())
+            });
+        let screen_read = self.screen_status.status().is_some();
+
         let session = self.terminal.agent_session();
-        if session.as_ref().is_some_and(|s| s.rich) {
+        if session.as_ref().is_some_and(|s| s.rich) || screen_read {
             self.agent_was_rich = true;
         }
-        if self.terminal.foreground_agent().is_none() && session.is_none() {
+        if agent.is_none() && session.is_none() {
             self.agent_was_rich = false;
         }
 
@@ -3579,7 +3616,7 @@ impl TerminalView {
             cx.emit(AgentSessionChanged);
         }
 
-        let status = session.as_ref().map(|s| s.status);
+        let status = self.agent_status();
         if status == self.last_agent_status {
             return false;
         }
@@ -3604,7 +3641,8 @@ impl TerminalView {
             }
         }
 
-        let rich = session.as_ref().is_some_and(|s| s.rich);
+        // A status read off the screen is as much a report as a hook's.
+        let rich = session.as_ref().is_some_and(|s| s.rich) || screen_read;
         let agent_name = self
             .terminal
             .foreground_agent()

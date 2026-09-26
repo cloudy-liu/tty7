@@ -280,12 +280,11 @@ impl Tty7App {
                 let badge_pos = badge_pos[i];
                 let tab = &self.tabs[i];
                 let is_active = i == active;
-                let ssh_dot = self.tab_ssh_dot(tab, cx);
+                let ssh_indicator = self.tab_ssh_indicator(tab, cx);
                 let agent_badge = tab.focused_agent_badge(Some(window), cx);
                 let agent = agent_badge.agent;
                 let avatar = TabAvatar::choose(agent, tab.foreground_app(Some(window), cx));
-                let agent_status = agent_badge.status;
-                let agent_unread = agent_badge.unread;
+                let agent_indicator = agent_badge.indicator();
                 let git_cwd = diff_click_cwd(
                     cx.global::<Config>(),
                     tab.pane.focused_or_first(window, cx).and_then(|leaf| {
@@ -305,6 +304,28 @@ impl Tty7App {
                 let title_size = 0.875 * rem;
                 let meta_size = 0.75 * rem;
                 let title_font = if is_active { &title_font_active } else { &font };
+                // An agent row opens its second line with the status, in the
+                // badge's colour, the way herdr writes `idle · codex`. The
+                // word never elides; whatever follows it gives up the room.
+                let status_word = agent_indicator.map(|s| {
+                    let dark = crate::ui::presets::surface_is_dark(cx.theme().sidebar);
+                    (s.word(), gpui::rgb(s.rgb(dark)))
+                });
+                let status_w = status_word.map_or(0., |(word, _)| {
+                    measure_text(&window.text_system(), &font, meta_size, word)
+                        + measure_text(&window.text_system(), &font, meta_size, "·")
+                        + 2. * row_metrics::META_GAP
+                });
+                let status_lead = || {
+                    status_word.map(|(word, colour)| {
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().text_color(colour).child(word))
+                            .child(div().child("·"))
+                    })
+                };
                 // Title: elide the *full* label against the row budget, so a
                 // wide sidebar shows the whole thing and a narrow one keeps
                 // whichever end identifies it — the tail for a path, both
@@ -362,6 +383,7 @@ impl Tty7App {
                         .gap_1p5()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
+                        .children(status_lead())
                         .child(
                             gpui::svg()
                                 .path("icons/git-branch.svg")
@@ -401,9 +423,12 @@ impl Tty7App {
                     }
                     // Branch: keep both ends (`window-…backdrop`) so its
                     // identifying tail survives a narrow sidebar.
-                    let branch_avail =
-                        (label_avail - row_metrics::BRANCH_ICON - row_metrics::META_GAP - counts_w)
-                            .max(0.);
+                    let branch_avail = (label_avail
+                        - status_w
+                        - row_metrics::BRANCH_ICON
+                        - row_metrics::META_GAP
+                        - counts_w)
+                        .max(0.);
                     let shown = elide_keep_edges(
                         &window.text_system(),
                         &font,
@@ -487,14 +512,40 @@ impl Tty7App {
                                 &font,
                                 meta_size,
                                 &full,
-                                label_avail,
+                                (label_avail - status_w).max(0.),
                             );
                             (shown, full)
                         })
                         // The title already carries the whole path; a second
                         // copy adds noise, not information.
-                        .filter(|(shown, _)| shown.as_ref() != shown_title.as_ref());
+                        .filter(|(_, full)| {
+                            full_title
+                                .as_ref()
+                                .map_or(shown_title.as_ref(), |t| t.as_ref())
+                                != full.as_ref()
+                        });
                 }
+                // Outside a repo an agent row still owes its status a line,
+                // even when the cwd was dropped as a copy of the title.
+                let cwd_line = git_line
+                    .is_none()
+                    .then(|| {
+                        let cwd = cwd_shown.as_ref().map(|(cwd, _)| cwd.clone());
+                        (status_word.is_some() || cwd.is_some()).then(|| {
+                            h_flex()
+                                .id(("sidebar-cwd", i))
+                                .w_full()
+                                .items_center()
+                                .gap_1p5()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                .children(status_lead())
+                                .children(
+                                    cwd.map(|cwd| div().flex_1().min_w_0().truncate().child(cwd)),
+                                )
+                        })
+                    })
+                    .flatten();
                 let rename_input = self
                     .renaming
                     .as_ref()
@@ -627,18 +678,7 @@ impl Tty7App {
                                 .child(shown_title),
                         )
                         .children(git_line)
-                        .when_some(cwd_shown, |col, (cwd, _)| {
-                            col.child(
-                                h_flex()
-                                    .id(("sidebar-cwd", i))
-                                    .w_full()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground.opacity(0.8))
-                                    .child(div().flex_1().min_w_0().truncate().child(cwd)),
-                            )
-                        })
+                        .children(cwd_line)
                         .into_any_element(),
                 };
 
@@ -720,9 +760,8 @@ impl Tty7App {
                     .child(self.tab_avatar(
                         ("sidebar-avatar", i),
                         avatar,
-                        agent_status,
-                        agent_unread,
-                        ssh_dot,
+                        agent_indicator,
+                        ssh_indicator,
                         22.,
                         cx,
                     ))

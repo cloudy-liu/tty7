@@ -9,7 +9,7 @@ the agent you get, running in a normal PTY, with its own UI. tty7 adds the
 things a terminal is in a position to add — who is running where, what they
 need, and what changed.
 
-<Frame caption="Placeholder — screenshot: a sidebar of agent sessions across several repos, each with a brand avatar and status dot">
+<Frame caption="Placeholder — screenshot: a sidebar of agent sessions across several repos, each with a brand avatar and status symbol">
   <img src="/images/placeholder.svg" alt="Agent sessions in the tty7 sidebar" />
 </Frame>
 
@@ -88,7 +88,9 @@ Just by running an agent in a pane:
 
 Live status — **working**, **needs your input**, **done** — comes from the agent
 itself, over a channel tty7 installs into that agent's configuration. It powers
-the status dots, the notifications, the tray icon, and `tty7 wait`.
+the status symbols, the notifications, the tray icon, and `tty7 wait`. For
+agents with a herdr detection manifest, the window also reads the status off
+the agent's screen, so Cursor and Antigravity get a status with no hooks at all.
 
 Installing takes one click per agent under **Settings → Agents**.
 [Status and notifications →](/agents/status)
@@ -97,7 +99,7 @@ Installing takes one click per agent under **Settings → Agents**.
 
 <CardGroup cols={3}>
   <Card title="Status and notifications" icon="circle-dot" href="/agents/status">
-    Hooks, status dots, the tray icon.
+    Hooks, screen reading, status symbols, the tray icon.
   </Card>
   <Card title="Sessions" icon="code-branch" href="/agents/sessions">
     Resume, fork, and copying a session id.

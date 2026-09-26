@@ -10,7 +10,7 @@ is doing.
 
 <kbd>⌘ B</kbd> shows and hides it. Drag its right edge to resize.
 
-<Frame caption="Placeholder — screenshot: the sidebar with two repo groups, agent avatars and status dots, branch and +N −M counts">
+<Frame caption="Placeholder — screenshot: the sidebar with two repo groups, agent avatars and status symbols, branch and +N −M counts">
   <img src="/images/placeholder.svg" alt="The tty7 tab sidebar" />
 </Frame>
 
@@ -31,8 +31,10 @@ tabs whose shell has not reported a directory yet.
 
 <CardGroup cols={2}>
   <Card title="Who is running there" icon="robot">
-    A brand avatar when a coding agent is in the tab, plus a status dot —
-    blue for working, amber for needs-your-input, green for done.
+    A brand avatar when a coding agent is in the tab, plus herdr's status
+    symbol: × blocked, ◐ working, ✓ done, ○ idle, · unknown. The row's second
+    line starts with the same state as a coloured word, `working · main`. See
+    [status](/agents/status#the-status-symbol).
   </Card>
   <Card title="Where it is" icon="code-branch">
     The pane's git branch, refreshed on `cd` and whenever a command finishes.
@@ -42,9 +44,9 @@ tabs whose shell has not reported a directory yet.
     [diff overlay](/git/diffs).
   </Card>
   <Card title="Whether you have looked" icon="circle-dot">
-    An unread marker on tabs where a coding agent finished its turn while you
-    were elsewhere. Agent tabs also carry *Mark as Unread* in the right-click
-    menu, once there is a finished turn to mark.
+    A finished turn you have not looked at yet keeps its ✓ until you open the
+    tab. Agent tabs also carry *Mark as Unread* in the right-click menu, once
+    there is a finished turn to mark.
   </Card>
 </CardGroup>
 
@@ -91,4 +93,4 @@ The sidebar, top tab strip, and switcher identify a split tab by its focused
 tty7 pane. A background tab uses its last focused pane. When Herdr runs in that
 pane, its purple sheep avatar stays visible even if a Herdr workspace launches
 Codex or Claude Code. A separate tty7 split running an agent shows that agent's
-avatar when you focus the split. Status dots follow the selected pane.
+avatar when you focus the split. Status symbols follow the selected pane.

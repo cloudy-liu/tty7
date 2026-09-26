@@ -21,6 +21,7 @@ pub mod palette;
 pub(crate) mod pane_liveness;
 mod remote;
 mod reverse_search;
+pub(crate) mod screen_status;
 pub(crate) mod scrollbar;
 pub mod search;
 mod signature;
