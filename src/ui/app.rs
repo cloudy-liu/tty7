@@ -477,6 +477,15 @@ pub(crate) struct TabAgentBadge {
     pub(crate) unread: usize,
 }
 
+impl TabAgentBadge {
+    /// The corner mark this badge draws, or `None` when no agent runs here.
+    pub(crate) fn indicator(&self) -> Option<crate::ui::status_indicator::StatusIndicator> {
+        self.agent.map(|_| {
+            crate::ui::status_indicator::StatusIndicator::of_agent(self.status, self.unread > 0)
+        })
+    }
+}
+
 fn badge_for_focused_pane(
     focused: Option<gpui::EntityId>,
     rows: impl IntoIterator<Item = (gpui::EntityId, TabAgentBadge)>,
@@ -627,11 +636,11 @@ impl Tab {
             self.pane.terminals().into_iter().map(|leaf| {
                 let view = leaf.read(cx);
                 let agent = view.agent();
-                let session_status = view.agent_session().map(|session| session.status);
-                let status = agent.map(|_| session_status.unwrap_or(AgentStatus::Idle));
-                let unread = usize::from(
-                    session_status == Some(AgentStatus::Done) && view.agent_result_unread(),
-                );
+                // `None` for an agent neither its hooks nor its screen have
+                // said anything about: the unknown state, not idle.
+                let status = view.agent_status();
+                let unread =
+                    usize::from(status == Some(AgentStatus::Done) && view.agent_result_unread());
                 (
                     leaf.entity_id(),
                     TabAgentBadge {
@@ -661,12 +670,8 @@ impl Tab {
             let view = l.read(cx);
             let agent = view.agent()?;
             // A pane whose agent is running but has never reported a
-            // session reads as idle, the same reading the badge has always
-            // given it.
-            let status = view
-                .agent_session()
-                .map(|s| s.status)
-                .unwrap_or(AgentStatus::Idle);
+            // status ranks as idle.
+            let status = view.agent_status().unwrap_or(AgentStatus::Idle);
             Some((agent, status))
         }))
     }
@@ -1783,10 +1788,7 @@ impl Tty7App {
             for leaf in tab.pane.terminals() {
                 let view = leaf.read(cx);
                 let Some(agent) = view.agent() else { continue };
-                let status = view
-                    .agent_session()
-                    .map(|s| s.status)
-                    .unwrap_or(AgentStatus::Idle);
+                let status = view.agent_status().unwrap_or(AgentStatus::Idle);
                 let dir = view
                     .cwd()
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
@@ -4445,7 +4447,7 @@ impl Tty7App {
             let refocus_incoming =
                 refocus.as_ref().map(|s| s.entity_id()) == Some(leaf.entity_id());
             leaf.update(cx, |view, cx| {
-                if view.agent_session().map(|s| s.status) == Some(AgentStatus::Done) {
+                if view.agent_status() == Some(AgentStatus::Done) {
                     view.mark_agent_result_unread(refocus_incoming);
                     cx.notify();
                 }
@@ -4648,7 +4650,7 @@ impl Tty7App {
             );
             return None;
         };
-        if session.status == AgentStatus::Working {
+        if view.agent_status() == Some(AgentStatus::Working) {
             window.push_notification(t_fmt(L10nKey::AppForkMidTurn, &[("name", &name)]), cx);
         }
         Some(cmd)
@@ -6203,28 +6205,26 @@ impl Tty7App {
         self.settings.as_mut()
     }
 
-    pub(crate) fn tab_ssh_dot(&self, tab: &Tab, cx: &App) -> Option<u32> {
+    /// The mark an SSH tab wears while its link needs watching. A healthy
+    /// connection wears none: its green dot was the same green as a finished
+    /// agent turn, and said nothing the tab's title did not.
+    pub(crate) fn tab_ssh_indicator(
+        &self,
+        tab: &Tab,
+        cx: &App,
+    ) -> Option<crate::ui::status_indicator::StatusIndicator> {
         use crate::daemon::protocol::SshPhase;
+        use crate::ui::status_indicator::StatusIndicator;
         let leaf = tab.pane.first_leaf()?;
         let v = leaf.terminal()?.read(cx);
-        if let Some(phase) = v.ssh_phase() {
-            let rgb = if v.ssh_disconnected() {
-                0xEF4444
-            } else {
-                match phase {
-                    SshPhase::Connecting | SshPhase::Authenticating => 0xF59E0B,
-                    SshPhase::Connected => 0x22C55E,
-                    SshPhase::Failed { .. } => 0xEF4444,
-                }
-            };
-            Some(rgb)
-        } else if v
-            .remote_context()
-            .is_some_and(|r| r.kind != crate::daemon::protocol::RemoteKind::Wsl)
-        {
-            Some(0x9CA3AF)
-        } else {
-            None
+        let phase = v.ssh_phase()?;
+        if v.ssh_disconnected() {
+            return Some(StatusIndicator::Blocked);
+        }
+        match phase {
+            SshPhase::Connecting | SshPhase::Authenticating => Some(StatusIndicator::Working),
+            SshPhase::Connected => None,
+            SshPhase::Failed { .. } => Some(StatusIndicator::Blocked),
         }
     }
 

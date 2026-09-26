@@ -163,9 +163,8 @@ struct TabRow {
     /// next to it just prints the same place twice.
     named: bool,
     avatar: TabAvatar,
-    status: Option<crate::core::cli_agent::AgentStatus>,
-    unread: usize,
-    ssh: Option<u32>,
+    indicator: Option<crate::ui::status_indicator::StatusIndicator>,
+    ssh: Option<crate::ui::status_indicator::StatusIndicator>,
     active: bool,
     /// Branch and diff counts, the same line the tab sidebar shows. Only this
     /// window's own tabs have it — the machine tree carries no git state.
@@ -935,9 +934,8 @@ impl Tty7App {
                             .map(|(p, home)| crate::ui::home::display_path(&p, home.as_deref()))
                             .unwrap_or_default(),
                         avatar: TabAvatar::choose(focused.agent, tab.foreground_app(None, cx)),
-                        status: focused.status,
-                        unread: focused.unread,
-                        ssh: self.tab_ssh_dot(tab, cx),
+                        indicator: focused.indicator(),
+                        ssh: self.tab_ssh_indicator(tab, cx),
                         active: i == self.active,
                         git: tab.git_status(None, cx),
                     }
@@ -980,8 +978,11 @@ impl Tty7App {
                     })
                     .unwrap_or_default(),
                 avatar: TabAvatar::choose(v.focused_agent, v.foreground_app),
-                status: v.focused_status,
-                unread: 0,
+                // The tree carries no read state, so a finished turn keeps its
+                // check here rather than claiming someone has seen it.
+                indicator: v.focused_agent.map(|_| {
+                    crate::ui::status_indicator::StatusIndicator::of_agent(v.focused_status, true)
+                }),
                 ssh: None,
                 active: Some(v.id) == active,
                 git: git(v.cwd.as_deref()),
@@ -2856,8 +2857,7 @@ impl Tty7App {
                     .child(self.tab_avatar(
                         ("switcher-avatar", index),
                         tab.avatar,
-                        tab.status,
-                        tab.unread,
+                        tab.indicator,
                         tab.ssh,
                         ROW_AVATAR,
                         cx,
@@ -3390,8 +3390,7 @@ mod tests {
             path: path.to_string(),
             named: false,
             avatar: TabAvatar::Terminal,
-            status: None,
-            unread: 0,
+            indicator: None,
             ssh: None,
             active: false,
             git: None,

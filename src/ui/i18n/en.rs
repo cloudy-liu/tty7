@@ -1750,6 +1750,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::AgentStatusWorking => "Working",
         L10nKey::AgentStatusWaiting => "Needs input",
         L10nKey::AgentStatusDone => "Done",
+        L10nKey::AgentStatusIdle => "Idle",
+        L10nKey::AgentStatusUnknown => "Status unknown",
         L10nKey::NotifyCommandFinished => "Command finished after {secs}s",
         L10nKey::NotifyCommandFinishedWithCommand => "{command} — finished after {secs}s",
         L10nKey::NotifyAgentFinished => "Finished after {secs}s",

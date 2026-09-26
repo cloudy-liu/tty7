@@ -1660,6 +1660,8 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::AgentStatusWorking => "运行中",
         L10nKey::AgentStatusWaiting => "需要输入",
         L10nKey::AgentStatusDone => "已完成",
+        L10nKey::AgentStatusIdle => "空闲",
+        L10nKey::AgentStatusUnknown => "状态未知",
         L10nKey::NotifyCommandFinished => "命令运行完成，用时 {secs} 秒",
         L10nKey::NotifyCommandFinishedWithCommand => "{command} 已完成，用时 {secs} 秒",
         L10nKey::NotifyAgentFinished => "已完成，用时 {secs} 秒",

@@ -1821,6 +1821,8 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::AgentStatusWorking => "実行中",
         L10nKey::AgentStatusWaiting => "入力が必要",
         L10nKey::AgentStatusDone => "完了",
+        L10nKey::AgentStatusIdle => "待機中",
+        L10nKey::AgentStatusUnknown => "状態不明",
         L10nKey::NotifyCommandFinished => "コマンドが {secs} 秒で完了しました",
         L10nKey::NotifyCommandFinishedWithCommand => "{command} — {secs} 秒で完了しました",
         L10nKey::NotifyAgentFinished => "{secs} 秒で完了しました",

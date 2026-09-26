@@ -982,6 +982,8 @@ l10n_keys! {
     AgentStatusWorking,
     AgentStatusWaiting,
     AgentStatusDone,
+    AgentStatusIdle,
+    AgentStatusUnknown,
     NotifyCommandFinished,
     NotifyCommandFinishedWithCommand,
     NotifyAgentFinished,

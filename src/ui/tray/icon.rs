@@ -92,35 +92,55 @@ pub(super) fn agent_avatar(
         None,
     );
 
-    if let Some(rgb) = status.dot_rgb() {
-        let (cx, cy, r) = (s * 0.80, s * 0.80, s * 0.17);
-        let circle = |radius: f32| {
-            let mut pb = tiny_skia::PathBuilder::new();
-            pb.push_circle(cx, cy, radius);
-            pb.finish()
-        };
-        if let Some(ring) = circle(r * 1.45) {
-            paint.blend_mode = tiny_skia::BlendMode::Clear;
-            pixmap.fill_path(
-                &ring,
-                &paint,
-                tiny_skia::FillRule::Winding,
-                tiny_skia::Transform::identity(),
-                None,
-            );
-        }
-        if let Some(dot) = circle(r) {
-            paint.blend_mode = tiny_skia::BlendMode::SourceOver;
-            paint.set_color_rgba8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 0xFF);
-            pixmap.fill_path(
-                &dot,
-                &paint,
-                tiny_skia::FillRule::Winding,
-                tiny_skia::Transform::identity(),
-                None,
-            );
-        }
+    // The same symbol the tab avatars wear. A tray menu's background belongs to
+    // the OS, so the symbol brings its own surface: Catppuccin Mocha's base,
+    // the one herdr's dark colours are drawn for.
+    let indicator = crate::ui::status_indicator::StatusIndicator::of_status(status);
+    let (cx, cy, r) = (s * 0.78, s * 0.78, s * 0.22);
+    let circle = |radius: f32| {
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.push_circle(cx, cy, radius);
+        pb.finish()
+    };
+    if let Some(ring) = circle(r * 1.25) {
+        paint.blend_mode = tiny_skia::BlendMode::Clear;
+        pixmap.fill_path(
+            &ring,
+            &paint,
+            tiny_skia::FillRule::Winding,
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
+    if let Some(disc) = circle(r) {
+        paint.blend_mode = tiny_skia::BlendMode::SourceOver;
+        paint.set_color_rgba8(0x1E, 0x1E, 0x2E, 0xFF);
+        pixmap.fill_path(
+            &disc,
+            &paint,
+            tiny_skia::FillRule::Winding,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+    }
+    let svg = crate::ui::assets::Assets
+        .load(indicator.icon_path())
+        .ok()
+        .flatten()?;
+    let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).ok()?;
+    let mark_size = (r * 2.0).round() as u32;
+    let mut mark = tiny_skia::Pixmap::new(mark_size, mark_size)?;
+    resvg::render(&tree, fit_center(&tree, mark_size), &mut mark.as_mut());
+    let rgb = indicator.rgb(true);
+    recolor(&mut mark, ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
+    pixmap.draw_pixmap(
+        (cx - mark_size as f32 / 2.0).round() as i32,
+        (cy - mark_size as f32 / 2.0).round() as i32,
+        mark.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        tiny_skia::Transform::identity(),
+        None,
+    );
 
     Some(pixmap)
 }

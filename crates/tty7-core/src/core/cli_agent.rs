@@ -955,17 +955,6 @@ pub struct AgentSessionState {
     pub activity: u64,
 }
 
-impl AgentStatus {
-    pub fn dot_rgb(self) -> Option<u32> {
-        match self {
-            AgentStatus::Idle => None,
-            AgentStatus::Working => Some(0x3B82F6),
-            AgentStatus::Waiting => Some(0xF59E0B),
-            AgentStatus::Done => Some(0x22C55E),
-        }
-    }
-}
-
 impl AgentSessionState {
     fn default_status() -> AgentStatus {
         AgentStatus::Idle
@@ -2568,15 +2557,7 @@ mod tests {
     }
 
     #[test]
-    fn status_metadata_is_consistent() {
-        assert_eq!(AgentStatus::Idle.dot_rgb(), None);
-        for st in [
-            AgentStatus::Working,
-            AgentStatus::Waiting,
-            AgentStatus::Done,
-        ] {
-            assert!(st.dot_rgb().is_some());
-        }
+    fn status_serializes_in_kebab_case() {
         assert_eq!(
             serde_json::to_string(&AgentStatus::Waiting).unwrap(),
             "\"waiting\""

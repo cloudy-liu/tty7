@@ -37,6 +37,7 @@ pub mod sftp;
 pub mod sftp_host;
 pub mod ssh_connect;
 pub mod ssh_prompt;
+pub mod status_indicator;
 pub mod switcher;
 pub mod tab_sidebar;
 pub mod tab_strip;
